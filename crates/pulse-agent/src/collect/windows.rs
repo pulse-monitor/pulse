@@ -30,9 +30,9 @@ impl WindowsCollector {
         sys.refresh_cpu_usage();
         Self {
             sys,
-            disks: Disks::new_with_refreshed_list,
-            nets: Networks::new_with_refreshed_list,
-            gpu: Gpu::probe,
+            disks: Disks::new_with_refreshed_list(),
+            nets: Networks::new_with_refreshed_list(),
+            gpu: Gpu::probe(),
             prev_net: None,
         }
     }
@@ -126,7 +126,7 @@ impl Collector for WindowsCollector {
             load: [0; 3], // capabilities.load_average = false，前端会隐藏
             mem: Mem {
                 total,
-                free: self.sys.free_memory,
+                free: self.sys.free_memory(),
                 // Windows 的 ullAvailPhys 就是 available 语义；无 buff/cache 概念，
                 // 所以「含缓冲」开关在这台机器上两种口径结果相同
                 available: self.sys.available_memory(),

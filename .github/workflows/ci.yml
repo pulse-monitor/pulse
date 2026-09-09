@@ -54,7 +54,11 @@ jobs:
       - run: cargo install cargo-zigbuild --locked
       - run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
 
-  # Windows 同样要原生编：zigbuild 顶不了 MSVC 工具链
+  # Windows 同样要原生编：zigbuild 顶不了 MSVC 工具链。
+  #
+  # 本地想验 Windows 代码的话用 `cargo zigbuild --target x86_64-pc-windows-gnu
+  # --workspace --all-targets` —— gnu 目标 zig 能顶，够用来发现
+  # `#[cfg(windows)]` 里的编译错误，不必等 CI。
   cross-windows:
     name: 交叉编译（x86_64-pc-windows-msvc）
     runs-on: windows-latest

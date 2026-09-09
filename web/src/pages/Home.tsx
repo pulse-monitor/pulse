@@ -207,9 +207,12 @@ export default function Home() {
       />
 
       <div className="relative">
-        {/* 统计只占左边一半多一点，右边留给球 */}
-        <div className="lg:w-[62%] xl:w-[58%]">
+        {/* 统计只占左边一半多一点，右边留给球。
+            到期提醒跟在下面、共用这个宽度 —— 它是汇总信息的一部分，
+            铺满整个宽度的话名字在最左、金额在最右，中间一大片空 */}
+        <div className="space-y-4 lg:w-[62%] xl:w-[58%]">
           <StatBar s={summary} servers={entries} />
+          {expiring && <Expiring items={expiring.items} currency={expiring.currency} />}
         </div>
 
         {/* 图例浮在球上面。窄屏时跟在统计下面，宽屏时贴到右上 */}
@@ -218,9 +221,6 @@ export default function Home() {
           className="mt-3 justify-center lg:absolute lg:right-1 lg:top-0 lg:mt-0 lg:max-w-[34%] lg:justify-end"
         />
       </div>
-
-      {/* 到期提醒是「要你去处理」的信息，放在列表上方；没有就整块不出现 */}
-      {expiring && <Expiring items={expiring.items} currency={expiring.currency} />}
 
       <div className="relative">
         <div className="space-y-4">

@@ -175,6 +175,17 @@ html[data-theme="dark"] .panel {
   }
 }
 
+/* 「即将到期」轮播切换时的淡入。硬切太突兀，
+   但也不该慢到让人等 —— 200ms 够了 */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: none; }
+}
+.animate-fade { animation: fade-in .2s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade { animation: none; }
+}
+
 /* 状态不能只靠颜色区分（色盲友好）：形状也不同 */
 .dot-on::before { content: "●"; }
 .dot-off::before { content: "○"; }

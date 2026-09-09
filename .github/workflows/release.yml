@@ -19,8 +19,12 @@ env:
 jobs:
   build:
     name: 构建 ${{ matrix.target }}
-    # Apple 目标必须在 macOS 上编：链接要用 Xcode SDK，zig 提供不了
-    runs-on: ${{ contains(matrix.target, 'apple') && 'macos-latest' || 'ubuntu-latest' }}
+    # Apple 目标要 Xcode SDK、Windows 要 MSVC 工具链，两者 zig 都顶不了，
+    # 只能在各自的 runner 上原生编
+    runs-on: >-
+      ${{ contains(matrix.target, 'apple') && 'macos-latest'
+       || contains(matrix.target, 'windows') && 'windows-latest'
+       || 'ubuntu-latest' }}
     strategy:
       fail-fast: true # 少一个平台就不该发布
       matrix:
@@ -36,23 +40,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
-        if: ${{ !contains(matrix.target, 'apple') }}
+        if: ${{ contains(matrix.target, 'linux') }}
       - run: cargo install cargo-zigbuild --locked
-        if: ${{ !contains(matrix.target, 'apple') }}
+        if: ${{ contains(matrix.target, 'linux') }}
       - name: 构建
         env:
           # 公钥**编译期内置**。这是自更新第 2 道防线的前提：
           # 换公钥必须重新编译并重装 agent。
           # 它是公钥，放在 secret 里只是为了避免不同环境构建出不同产物。
           PULSE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        shell: bash
         run: |
           set -Eeuo pipefail
-          if [[ "${{ matrix.target }}" == *apple* ]]; then
-            cargo build --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
-          else
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
             cargo zigbuild --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
+          else
+            cargo build --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
           fi
       - name: 收集产物
+        shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p dist

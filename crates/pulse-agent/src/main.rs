@@ -226,6 +226,7 @@ enum SessionEnd {
 /// **只加不减**：公共 CA 照旧有效，证书链、有效期、主机名一样要验。
 /// 这里没有任何「跳过验证」的开关，也不打算加 —— 那等于把 TLS 关掉还留个假象。
 fn tls_connector(path: &str) -> Result<tokio_tungstenite::Connector> {
+    use rustls_pki_types::pem::PemObject;
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
     let pem = std::fs::read(path).with_context(|| format!("读不到 CA 证书：{path}"))?;
@@ -233,7 +234,7 @@ fn tls_connector(path: &str) -> Result<tokio_tungstenite::Connector> {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     let mut added = 0usize;
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.with_context(|| format!("解析 CA 证书失败：{path}"))?;
         roots
             .add(cert)

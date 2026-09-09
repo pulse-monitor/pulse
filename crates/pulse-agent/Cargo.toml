@@ -22,8 +22,10 @@ nvml-wrapper = { version = "0.13.0", optional = true }
 # C 编译器，会直接打断 musl 交叉编译。ring 是纯 Rust + 汇编，交叉编译没问题。
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1.0.9"
-# 只用来解析用户给的 CA 证书文件（PULSE_CA_CERT）。零依赖、纯解析。
-rustls-pemfile = "2.2.0"
+# 解析用户给的 CA 证书文件（PULSE_CA_CERT）。
+# 用 rustls 官方的 pki-types 而不是 rustls-pemfile —— 后者已经无人维护
+# （RUSTSEC-2025-0134），而 PEM 解析本来就该由类型库自己提供。
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # 自更新的签名校验。零依赖、纯 Rust、作者就是 minisign 本人（MIT）。
 # 只做**验证**，不含签名功能 —— agent 里没有任何需要私钥的代码路径。

@@ -12,7 +12,7 @@
 [![Docker](https://github.com/pulse-monitor/pulse/actions/workflows/docker.yml/badge.svg)](https://github.com/pulse-monitor/pulse/actions/workflows/docker.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**[📖 在线文档](https://pulse-docs.pages.dev/)** · [快速开始](#快速开始) · [Docker](#docker-部署) · [功能](#功能)
+**[📖 在线文档](https://pulse-monitor.github.io/pulse-docs/)** · [快速开始](#快速开始) · [Docker](#docker-部署) · [功能](#功能)
 
 </div>
 
@@ -49,7 +49,7 @@ curl -fsSL https://panel.example.com/install.sh | sudo bash -s -- \
 
 浏览器访问 `https://panel.example.com`，机器一两秒内变绿。
 
-更详细的步骤、反向代理、HTTPS 配置见 **[在线文档](https://pulse-docs.pages.dev/install/quick-start)**。
+更详细的步骤、反向代理、HTTPS 配置见 **[在线文档](https://pulse-monitor.github.io/pulse-docs/install/quick-start)**。
 
 ---
 
@@ -118,7 +118,7 @@ services:
 | `PULSE_TRUSTED_PROXY_HOPS` | `0` | 放在反代后面时设成代理层数 |
 | `PULSE_TIMEZONE` | `Asia/Shanghai` | 面板时区，影响账单周期日界 |
 
-完整清单见[文档](https://pulse-docs.pages.dev/install/config)。
+完整清单见[文档](https://pulse-monitor.github.io/pulse-docs/install/config)。
 
 > **务必走 HTTPS。** 探针的 token 放在 WebSocket 握手头里，明文链路上任何一跳都能拿到。
 > 面板启动时会检查这一点并告警。
@@ -154,7 +154,7 @@ cd web && npm install && npm run build   # 前端
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 ```
 
-开发相关的约定、项目结构、协议说明见 **[开发指南](https://pulse-docs.pages.dev/dev/build)**。
+开发相关的约定、项目结构、协议说明见 **[开发指南](https://pulse-monitor.github.io/pulse-docs/dev/build)**。
 
 ---
 

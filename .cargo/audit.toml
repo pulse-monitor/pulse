@@ -1,0 +1,20 @@
+# cargo-audit 的配置。
+#
+# cargo-audit 扫的是 Cargo.lock，而 Cargo.lock 记录的是**所有 feature 与
+# target 组合的并集**，不是我们实际编译进去的东西。所以这里的忽略项
+# 必须逐条附上「为什么它不在我们发布的二进制里」的证据，
+# 并且由 tools/check-deps.sh 用 `cargo tree` 再验一遍 ——
+# 哪天它真的被拉进构建图了，那个脚本会失败。
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 · rsa 0.9.x · Marvin 计时侧信道（中危，无可升级版本）
+    #
+    # rsa 只被 sqlx-mysql 用于 MySQL 的密码认证。我们只开了 sqlx 的
+    # sqlite feature，sqlx-mysql 从未进入构建图：
+    #   $ cargo tree -i rsa            → nothing to print
+    #   $ ls target/release/deps | grep -E 'rsa|sqlx_mysql'  → 空
+    #   $ strings target/release/pulse-server | grep -c mysql → 0
+    # 它出现在 Cargo.lock 里只是因为 lock 文件记录全部可能的解析结果。
+    "RUSTSEC-2023-0071",
+]

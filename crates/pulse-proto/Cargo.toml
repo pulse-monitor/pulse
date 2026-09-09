@@ -1,0 +1,13 @@
+[package]
+name = "pulse-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pulse agent <-> server wire protocol"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

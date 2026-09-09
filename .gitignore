@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 前端
+node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+# 构建期由 scripts/ 下的生成器产出
+web/public/flags/
+web/public/world-geo.json
+
+# 运行时数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 系统垃圾
+.DS_Store
+* [0-9].*

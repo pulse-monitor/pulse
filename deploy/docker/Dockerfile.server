@@ -1,0 +1,50 @@
+# Pulse 面板镜像。
+#
+# 三段构建：前端 → 后端 → 运行镜像。
+# 前端必须一起打进来 —— 面板要靠 PULSE_WEB_DIR 提供静态文件，
+# 只装二进制的话打开是一片空白。
+
+# ── 前端 ──
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+# 先只拷依赖清单，这样改代码不会让 npm ci 的缓存失效
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+COPY web/ ./
+# prebuild 会从 node_modules 里生成国旗与地图数据
+RUN npm run build
+
+# ── 后端 ──
+FROM rust:1.90-bookworm AS builder
+WORKDIR /src
+# 同理：依赖清单先行
+COPY Cargo.toml Cargo.lock ./
+COPY crates/pulse-proto/Cargo.toml crates/pulse-proto/
+COPY crates/pulse-agent/Cargo.toml crates/pulse-agent/
+COPY crates/pulse-server/Cargo.toml crates/pulse-server/
+COPY crates/pulse-loadgen/Cargo.toml crates/pulse-loadgen/
+RUN mkdir -p crates/pulse-proto/src crates/pulse-agent/src crates/pulse-server/src crates/pulse-loadgen/src \
+ && echo 'fn main() {}' > crates/pulse-server/src/main.rs \
+ && echo '' > crates/pulse-proto/src/lib.rs \
+ && echo 'fn main() {}' > crates/pulse-agent/src/main.rs \
+ && echo 'fn main() {}' > crates/pulse-loadgen/src/main.rs \
+ && cargo build --release -p pulse-server --locked || true
+COPY . .
+# 上一步留下的假产物要清掉，否则 cargo 认为不用重编
+RUN touch crates/*/src/*.rs && cargo build --release -p pulse-server --locked
+
+# ── 运行 ──
+# distroless 而不是 scratch：要读写 SQLite、要时区数据、要 CA 根证书
+#（拉汇率和 GeoIP 数据库要走 HTTPS）。同样没有 shell。
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /src/target/release/pulse-server /pulse-server
+COPY --from=web /web/dist /web/dist
+# distroless 的 nonroot 是 uid 65532
+USER 65532:65532
+VOLUME ["/data"]
+ENV PULSE_DATABASE_URL=sqlite:///data/pulse.db \
+    PULSE_DATA_DIR=/data \
+    PULSE_WEB_DIR=/web/dist \
+    PULSE_BIND=0.0.0.0:25774
+EXPOSE 25774
+ENTRYPOINT ["/pulse-server"]

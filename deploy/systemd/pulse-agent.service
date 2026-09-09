@@ -1,0 +1,93 @@
+# Pulse 探针的 systemd 单元。
+#
+# 每一条硬化指令都对照过 systemd.exec(5) 原文，并核过它对每个采集路径的影响 ——
+# 详见 docs/design/08-security.md。改动前请先读那一篇：这里有三条指令改错就会
+# **静默地**弄坏采集（不会报错，只会让某些指标永远是空的）。
+#
+# 验收：
+#   systemd-analyze security pulse-agent      # 目标 ≤ 2.0
+#   getpcaps $(pidof pulse-agent)             # 应为空
+#   ps -o user= -C pulse-agent                # 应为 pulse，不是 root
+#   ss -lntp | grep pulse                     # 应无输出（不监听任何端口）
+#
+# 硬化改完必须重跑 tools/check-linux-caps.sh 的沙箱模式，
+# 确认没有把哪个指标静默地挡掉。
+
+[Unit]
+Description=Pulse monitoring agent
+Documentation=https://github.com/<you>/pulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 二进制放在 StateDirectory 里，自动更新才有地方写
+#（/opt 在 ProtectSystem=strict 下是只读的）
+ExecStart=/var/lib/pulse-agent/bin/pulse-agent
+Restart=always
+RestartSec=5s
+# 防无限重启：10 分钟内起不来 5 次就停下，等人来看
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# ── 身份 ──
+# 固定系统用户，不用 DynamicUser：后者的随机 UID/GID 与自动更新、GPU 设备组、
+# 非特权 ICMP 三件事互斥（docs/design/08-security.md）
+User=pulse
+Group=pulse
+StateDirectory=pulse-agent
+StateDirectoryMode=0750
+# token 从环境文件读，不进命令行 —— 命令行对同机任何用户 ps 可见
+EnvironmentFile=/etc/pulse-agent/env
+
+# ── 权限：零 capability ──
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+# 真机实测发现的两处白捡分（systemd-analyze security 2.1 → 1.9）：
+# 探针创建的文件不该 world-readable，也不用 SysV IPC。
+# 两条都不影响任何采集功能。
+UMask=0077
+RemoveIPC=yes
+
+# ── 文件系统 ──
+ProtectSystem=strict
+# ⚠️ 必须是 read-only 不能是 yes：yes 会让 /home 与 /root 变成 inaccessible，
+#    挂在这两个目录下的数据盘就 statvfs 不到了
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/pulse-agent
+
+# ── /proc 可见性 ──
+# ⚠️ ProcSubset 必须是 all：pid 会隐藏 /proc/stat、/proc/meminfo、/proc/net/*，
+#    几乎所有指标都会瞎掉
+ProcSubset=all
+# ⚠️ ProtectProc 必须是 default：invisible 会让进程数只能看到自己
+ProtectProc=default
+
+# ── 内核 ──
+# 这几条把 /proc/sys 与 /sys 变成「只读」而不是「不可访问」——
+# 读 /sys/class/hwmon 的温度、/sys/fs/cgroup 的容器限额都不受影响
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_NETLINK：sysinfo 的部分路径走 netlink 取网卡信息
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# ── 日志 ──
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

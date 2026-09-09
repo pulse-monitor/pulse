@@ -1,0 +1,47 @@
+[package]
+name = "pulse-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pulse-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+axum = { version = "0.8.9", features = ["ws"] }
+tower-http = { version = "0.7.1", features = ["fs", "cors"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+async-trait = "0.1.92"
+dashmap = "6.2.1"
+argon2 = "0.5.3"
+jsonwebtoken = "9.3.1"
+sha2 = "0.10.9"
+# GeoIP 表的无锁热替换：刷新时不阻塞查询。
+# 查表在每个 agent 连接时都会发生，用 RwLock 会让刷新那一刻所有连接排队。
+arc-swap = "1.7"
+hex = "0.4.3"
+rand = "0.9.5"
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+futures-util = "0.3.34"
+time = { version = "0.3.44", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10.4"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls-no-provider", "charset", "http2"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# 面板自己终止 TLS，不必再架一层 nginx/Caddy —— 这个项目的前提就是「组件少」。
+# 用 no-provider：ring 的加密后端由上面那行 rustls 提供，不要它默认拉进 aws-lc-rs
+#（会多一份 C 代码和一套构建依赖）。
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+aes-gcm = "0.10.3"
+minijinja = "2.24.0"
+hmac = "0.12.1"
+base64 = "0.23.1"
+lettre = { version = "0.11.19", default-features = false, features = ["smtp-transport", "tokio1-rustls", "builder", "ring", "webpki-roots"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

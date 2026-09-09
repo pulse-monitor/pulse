@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（形如 0.4.0，不带 v）'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true # 少一个平台就不该发布
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - run: cargo install cargo-zigbuild --locked
+      - name: 构建
+        env:
+          # 公钥**编译期内置**。这是自更新第 2 道防线的前提：
+          # 换公钥必须重新编译并重装 agent。
+          # 它是公钥，放在 secret 里只是为了避免不同环境构建出不同产物。
+          PULSE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
+      - name: 收集产物
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          ext=""; case "${{ matrix.target }}" in *windows*) ext=".exe";; esac
+          cp "target/${{ matrix.target }}/release/pulse-agent$ext"  "dist/pulse-agent-${{ matrix.target }}$ext"
+          cp "target/${{ matrix.target }}/release/pulse-server$ext" "dist/pulse-server-${{ matrix.target }}$ext"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+          retention-days: 1
+
+  frontend:
+    name: 构建前端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: tar -czf web-dist.tar.gz -C web dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web-dist.tar.gz
+          retention-days: 1
+
+  sign-and-publish:
+    name: 签名并发布
+    needs: [build, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+      - name: 汇总产物
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          find staging -type f -exec cp {} dist/ \;
+          ls -1 dist/
+
+      - name: 生成 SHA256 清单
+        working-directory: dist
+        run: |
+          set -Eeuo pipefail
+          # 必须是 sha256sum 的标准格式：agent 侧的解析器认这个
+          # （crates/pulse-agent/src/update/manifest.rs）
+          sha256sum ./* > SHA256SUMS
+          # 去掉 ./ 前缀 —— agent 是按裸文件名查的
+          sed -i 's| \./| |; s|\*\./|*|' SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 安装 minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: 签名清单
+        working-directory: dist
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${MINISIGN_KEY:-}" ]; then
+            echo "❌ 没有配置 MINISIGN_SECRET_KEY —— 拒绝发布未签名的产物。" >&2
+            echo "   未签名的包会让所有 agent 的自更新失败（这是设计如此），" >&2
+            echo "   发出去只会制造一个坏版本。" >&2
+            exit 1
+          fi
+          printf '%s' "$MINISIGN_KEY" > /tmp/minisign.key
+          # 只签清单：清单里有每个文件的摘要，等价于签了全部产物，
+          # 而且 agent 只需要下一个小文件就能验证
+          printf '%s\n' "$MINISIGN_PASSWORD" | \
+            minisign -S -s /tmp/minisign.key -m SHA256SUMS -t "pulse ${GITHUB_REF_NAME:-manual}"
+          shred -u /tmp/minisign.key
+          # 自检：立刻用公钥验一遍，别发出去才发现签错了
+          printf '%s\n' "${{ secrets.MINISIGN_PUBLIC_KEY }}" > /tmp/minisign.pub
+          minisign -V -p /tmp/minisign.pub -m SHA256SUMS
+          echo "✔ 签名自检通过"
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

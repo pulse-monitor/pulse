@@ -1,0 +1,58 @@
+# cargo-deny：许可证、来源、重复依赖与安全公告。
+#
+# 与 cargo-audit 的分工：audit 只看安全公告，deny 还管许可证合规
+# 。
+
+[graph]
+# 只检查我们真正会发布的目标。不写的话会把 wasm、android 之类的
+# 依赖也拉进来，产生一堆与我们无关的告警。
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+yanked = "deny"
+# 这里**不需要**忽略 RUSTSEC-2023-0071（rsa 的 Marvin 攻击）：
+# cargo-deny 会按上面的 targets 裁剪依赖图，rsa 根本不在里面。
+# cargo-audit 只读 Cargo.lock、看不到 feature，所以那边必须显式忽略
+# —— 理由与证据写在 .cargo/audit.toml。
+
+[licenses]
+# 只允许宽松许可证。copyleft（GPL/AGPL/LGPL）一律不接受 ——
+# 这是个要给别人自由部署的项目，不能让依赖决定分发条款。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # foldhash（经 hashbrown 引入）
+    "Zlib",
+    # 零条款 BSD，等同公有领域（quoted_printable，经 lettre 引入）
+    "0BSD",
+    # webpki-roots 的许可证。它分发的是 **CA 证书数据**而不是代码，
+    # CDLA-Permissive-2.0 对使用和再分发没有限制，也不传染。
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+# 明确禁掉的：
+deny = [
+    # openssl 会把构建绑到系统库上，musl 交叉编译立刻崩。
+    # 全项目统一用 rustls（见 crates/pulse-agent/Cargo.toml 的注释）。
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

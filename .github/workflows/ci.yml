@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支的新推送取消旧任务，别把 runner 耗在过期的提交上
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 里不需要增量编译，反而更慢更占盘
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    name: Rust（格式 / clippy / 测试）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  cross:
+    name: 交叉编译（${{ matrix.target }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # ring 的 build script 需要目标平台的 C 编译器；zig 一个顶五个。
+      # 见 tools/cross-check.sh 里的说明。
+      - uses: mlugg/setup-zig@v2
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
+      # clippy 也按目标跑一遍：有些问题只在特定平台出现
+      # （musl 上 libc::time_t 被弃用就是这么发现的）
+      - run: cargo clippy --target ${{ matrix.target }} --workspace --all-targets -- -D warnings
+
+  frontend:
+    name: 前端（类型 / 单测 / 构建 / 首屏预算）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: npm run build
+      # 首屏预算是硬约束，超了就 fail
+      - name: 检查首屏体积 ≤ 180 KB gzip
+        run: |
+          set -Eeuo pipefail
+          total=0
+          for f in dist/assets/index-*.js dist/assets/index-*.css; do
+            [ -e "$f" ] || continue
+            sz=$(gzip -c "$f" | wc -c)
+            echo "  $(basename "$f")  $((sz / 1024)) KB gzip"
+            total=$((total + sz))
+          done
+          echo "首屏合计 $((total / 1024)) KB gzip（预算 180 KB）"
+          [ "$total" -le $((180 * 1024)) ] || { echo "❌ 超出首屏预算"; exit 1; }
+
+  security:
+    name: 安全（R18 断言 / 依赖审计）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # R18：探针不提权、不能远程执行。这些断言是机器可检的部分。
+      - run: sh tools/check-agent-hardening.sh
+      # 已发布的迁移文件改一个字节，已部署的实例就全部起不来（sqlx 校验和）
+      - run: sh tools/check-migrations.sh
+      - run: cargo install cargo-audit cargo-deny --locked
+      # 安全公告 + 许可证 + 「被忽略项的前提是否仍然成立」
+      - run: sh tools/check-deps.sh

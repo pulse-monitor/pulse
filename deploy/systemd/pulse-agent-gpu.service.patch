@@ -1,0 +1,14 @@
+# 启用 GPU 监控时需要额外授权 NVIDIA 设备节点。
+#
+# 放成 drop-in：/etc/systemd/system/pulse-agent.service.d/gpu.conf
+# 默认单元**不带任何 DeviceAllow** —— 不用 GPU 的机器不该有多余的设备权限。
+#
+# 前提：/dev/nvidia* 通常是 0666，非 root 本来就能访问；
+# 只有管理员把它收紧到 0660 时才需要下面这些。
+
+[Service]
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidia-uvm rw
+# 若管理员把设备收紧到 0660 + video 组，还需要：
+# SupplementaryGroups=video

@@ -1,0 +1,27 @@
+# 面板的 compose 模板。
+#
+# ⚠️ 尚未在真实 Docker 环境验证过。
+
+services:
+  server:
+    image: ghcr.io/<you>/pulse-server:latest
+    restart: unless-stopped
+    ports: ["25774:25774"]
+    volumes:
+      - ./data:/data                  # pulse.db + secret.key
+    environment:
+      PULSE_BIND: "0.0.0.0:25774"
+      # 生成安装命令时用这个地址，必须是用户实际访问的对外地址
+      PULSE_PUBLIC_URL: "https://panel.example.com"
+      # ⚠️ 前面有几层可信反代就填几。填错等于任何人都能伪造来源 IP，
+      #    把登录限流骗过去
+      PULSE_TRUSTED_PROXY_HOPS: "1"
+      PULSE_PUBLIC_MODE: "public"     # public | private
+      # 不设则首次启动自动生成随机密码并打一次日志
+      # PULSE_ADMIN_PASSWORD: "..."
+      RUST_LOG: "info"
+    healthcheck:
+      test: ["CMD", "/pulse-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

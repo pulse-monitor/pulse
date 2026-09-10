@@ -83,4 +83,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck deploy/scripts/*.sh tools/*.sh
+      # --severity=warning：info 级别的检查在不同 shellcheck 版本之间会漂 ——
+      # 开发机装的和 runner 上的不是同一版，本地全绿推上去照样红（踩过：
+      # trap 处理函数的 SC2317 只有新版报）。warning 及以上才是真问题。
+      - run: |
+          shellcheck --version | sed -n '2p'
+          shellcheck --severity=warning deploy/scripts/*.sh tools/*.sh

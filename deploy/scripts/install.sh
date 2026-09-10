@@ -50,7 +50,10 @@ die() { printf '%s错误:%s %s\n' "$RED" "$RST" "$1" >&2; exit 1; }
 # 错误不吞：任何一步失败都要留下痕迹，而不是静默退出。
 # （不打行号 —— trap 里的 $LINENO 是 trap 自己的位置，反而误导）
 TMP=""
-# shellcheck disable=SC2329  # 由下面的 `trap on_exit EXIT` 调用
+# trap 处理函数：shellcheck 静态看不到调用点，会把函数本身报成「未被调用」
+# （SC2329）、把函数体报成「不可达」（SC2317）。调用点是下面的
+# `trap on_exit EXIT`。
+# shellcheck disable=SC2329,SC2317
 on_exit() {
     st=$?
     [ -n "$TMP" ] && rm -rf "$TMP"

@@ -12,7 +12,9 @@ FROM node:22-bookworm-slim AS web
 ARG PULSE_WEB_REPO=https://github.com/pulse-monitor/pulse-web.git
 # 默认跟 main。要复现某个历史镜像就把它固定到 tag 或 commit
 ARG PULSE_WEB_REF=main
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# ca-certificates 不能省：slim 镜像里没有根证书，git 会直接
+# "server certificate verification failed. CAfile: none" 而不是给个能懂的错
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /web
 RUN git clone --depth 1 --branch "$PULSE_WEB_REF" "$PULSE_WEB_REPO" . \
@@ -37,6 +39,8 @@ RUN mkdir -p crates/pulse-proto/src crates/pulse-server/src crates/pulse-loadgen
 COPY . .
 # 上一步留下的假产物要清掉，否则 cargo 认为不用重编
 RUN touch crates/*/src/*.rs && cargo build --release -p pulse-server --locked
+# 一个属主正确的空 /data 带到运行镜像去（下面解释为什么非这样不可）
+RUN mkdir -p /out/data
 
 # ── 运行 ──
 # distroless 而不是 scratch：要读写 SQLite、要时区数据、要 CA 根证书
@@ -44,6 +48,18 @@ RUN touch crates/*/src/*.rs && cargo build --release -p pulse-server --locked
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /src/target/release/pulse-server /pulse-server
 COPY --from=web /web/dist /web/dist
+
+# /data 必须在镜像里就存在、且属主是 65532。
+#
+# Docker 建具名卷时会照搬镜像里同名目录的属主和权限；镜像里没有的话，
+# 卷就是 root:root，而容器以 65532 跑 —— SQLite 直接
+# "unable to open database file"，容器起都起不来（实测）。
+# distroless 没有 shell，RUN mkdir 用不了，只能从 builder 拷一个空目录过来。
+#
+# 注意：**bind mount 不吃这一套**。`-v /宿主/路径:/data` 用的是宿主目录的
+# 属主，得自己 `chown 65532:65532 /宿主/路径`。
+COPY --from=builder --chown=65532:65532 /out/data /data
+
 # distroless 的 nonroot 是 uid 65532
 USER 65532:65532
 VOLUME ["/data"]

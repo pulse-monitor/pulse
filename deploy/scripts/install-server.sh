@@ -124,8 +124,6 @@ if [ -z "$URL" ]; then
     warn "  这个地址会写进探针的安装命令。用域名的话请重跑并加上 --url"
 fi
 
-PASS=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)
-
 {
     echo "[Unit]"
     echo "Description=Pulse 面板"
@@ -142,7 +140,6 @@ PASS=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)
     echo "Environment=PULSE_DATABASE_URL=sqlite://$DIR/data/pulse.db"
     echo "Environment=PULSE_PUBLIC_URL=$URL"
     echo "Environment=PULSE_WEB_DIR=$DIR/web/dist"
-    [ -f "$DIR/data/pulse.db" ] || echo "Environment=PULSE_ADMIN_PASSWORD=$PASS"
     [ -z "$TLS_CERT" ] || echo "Environment=PULSE_TLS_CERT=$TLS_CERT"
     [ -z "$TLS_KEY" ]  || echo "Environment=PULSE_TLS_KEY=$TLS_KEY"
     echo "ExecStart=$DIR/pulse-server"
@@ -192,9 +189,14 @@ say "安装完成"
 echo "  面板地址: $URL"
 echo "  安装目录: $DIR"
 echo "  运行身份: $RUN_USER（非 root）"
-if [ -f "$DIR/data/pulse.db" ] && grep -q PULSE_ADMIN_PASSWORD /etc/systemd/system/pulse-server.service; then
-    echo "  管理员  : admin / $PASS"
-    echo "            ${YEL}这个密码只显示这一次${RST}"
+# 有没有建过管理员，问面板自己 —— 比翻数据库或猜 unit 文件都准
+setup_needed=$(curl -fsS --max-time 5 "$URL/api/v1/auth/setup" 2>/dev/null | grep -o 'true' || echo "")
+if [ -n "$setup_needed" ]; then
+    echo
+    echo "  ${YEL}下一步：打开面板设置管理员账号${RST}"
+    echo "    $URL"
+    echo "  用户名和密码由你在页面上自行设定，安装脚本不生成、也不保存密码。"
+    echo "  ${YEL}请立刻完成${RST} —— 在设置好之前，任何能打开该地址的人都能抢先创建管理员。"
 fi
 echo
 echo "  查看日志: journalctl -u pulse-server -f"

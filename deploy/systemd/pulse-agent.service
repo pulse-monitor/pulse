@@ -15,7 +15,7 @@
 
 [Unit]
 Description=Pulse monitoring agent
-Documentation=https://github.com/<you>/pulse
+Documentation=https://github.com/pulse-monitor/pulse-agent
 After=network-online.target
 Wants=network-online.target
 

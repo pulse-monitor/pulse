@@ -919,6 +919,17 @@ pub trait Storage: Send + Sync + 'static {
     // ── 管理员 ──
     async fn count_admins(&self) -> Result<i64>;
     async fn create_admin(&self, username: &str, password_hash: &str, now: i64) -> Result<i64>;
+    /// 只在**一个管理员都还没有**时创建，否则返回 `None`。
+    ///
+    /// 首次访问面板自行设定账号的入口靠它兜底：先查 count 再 INSERT 是
+    /// TOCTOU —— 两个请求可以都读到 0、然后各建一个不同用户名的管理员。
+    /// 所以判空和写入必须在**同一条语句**里完成。
+    async fn create_first_admin(
+        &self,
+        username: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<Option<i64>>;
     async fn get_admin(&self, username: &str) -> Result<Option<AdminUser>>;
     async fn touch_admin_login(&self, id: i64, now: i64) -> Result<()>;
 

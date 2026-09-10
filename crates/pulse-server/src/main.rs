@@ -58,7 +58,6 @@ async fn main() -> Result<()> {
 
     let secret =
         auth::load_or_create_secret(&data_dir.join("secret.key")).context("加载服务端密钥失败")?;
-    ensure_admin(store.as_ref()).await?;
 
     // 面板时区。账单周期是「你和商家的约定」，用统一时区可解释；
     // 机器时区五花八门会让同一天的重置发生在不同时刻。
@@ -82,6 +81,9 @@ async fn main() -> Result<()> {
         timezone: panel_tz,
         visitor_badge: env("PULSE_VISITOR_BADGE", "true") != "false",
     });
+    // 放在 config 之后：没有管理员时要把面板地址打进日志，得先知道地址
+    ensure_admin(store.as_ref(), &config.panel_url).await?;
+
     if config.trusted_proxy_hops == 0 {
         info!("未配置可信代理层数，将忽略 X-Forwarded-For（直连部署的正确默认值）");
     } else {
@@ -129,7 +131,7 @@ async fn main() -> Result<()> {
     let app = api::router(ctx, &web_dir)
         // 前后端分离部署时前端在另一个域名上，所以需要 CORS。
         // M3 仍用 permissive 便于本地调试；生产必须换成显式白名单
-        //。
+        //（把面板自己的域名列进 allow_origin）。
         .layer(CorsLayer::permissive());
 
     let bind = env("PULSE_BIND", DEFAULT_BIND);
@@ -196,41 +198,40 @@ fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// 首次启动时建管理员。
+/// 首次启动时的管理员引导。
 ///
-/// 刻意**不做开放的 setup 接口** —— 那会留下一个「谁先访问谁就是管理员」的
-/// 竞态窗口。改为在这里生成随机密码并打一次日志，用户从日志里取。
-/// 也可以用 `PULSE_ADMIN_PASSWORD` 预先指定。
-async fn ensure_admin(store: &dyn Storage) -> Result<()> {
+/// 默认**什么都不建** —— 管理员由用户打开面板、在初始化页面自行设定
+/// 用户名和密码（`POST /api/v1/auth/setup`）。这样安装时不必带参数，
+/// 也不用去日志里翻一次性密码。
+///
+/// 代价是：从面板起来到有人完成初始化之间，谁先访问谁就是管理员。
+/// 无人值守安装（Docker、批量部署）如果不能接受这个窗口，就设
+/// `PULSE_ADMIN_PASSWORD`（可配 `PULSE_ADMIN_USERNAME`，默认 admin），
+/// 这里会先把管理员建好，初始化接口从一开始就是关的。
+async fn ensure_admin(store: &dyn Storage, panel_url: &str) -> Result<()> {
     if store.count_admins().await.context("查询管理员数量")? > 0 {
         return Ok(());
     }
 
-    let (password, generated) = match std::env::var("PULSE_ADMIN_PASSWORD") {
-        Ok(p) if p.len() >= 8 => (p, false),
-        Ok(_) => {
-            anyhow::bail!("PULSE_ADMIN_PASSWORD 至少需要 8 个字符");
-        }
-        Err(_) => (auth::generate_token()?, true),
+    let Ok(password) = std::env::var("PULSE_ADMIN_PASSWORD") else {
+        warn!("──────────────────────────────────────────────────────────");
+        warn!("  面板尚未初始化。请立即打开下面的地址设置管理员账号：");
+        warn!("    {panel_url}");
+        warn!("  在设置完成前，任何能访问该地址的人都可以抢先创建管理员。");
+        warn!("──────────────────────────────────────────────────────────");
+        return Ok(());
     };
 
+    if password.chars().count() < 8 {
+        anyhow::bail!("PULSE_ADMIN_PASSWORD 至少需要 8 个字符");
+    }
+    let username = env("PULSE_ADMIN_USERNAME", DEFAULT_ADMIN);
     let hash = auth::hash_password(&password)?;
     store
-        .create_admin(DEFAULT_ADMIN, &hash, now_unix())
+        .create_admin(&username, &hash, now_unix())
         .await
         .context("创建管理员失败")?;
-
-    if generated {
-        // 只打这一次。密码没有存明文，忘了只能重置。
-        warn!("──────────────────────────────────────────────────────────");
-        warn!("  首次启动，已创建管理员账号：");
-        warn!("    用户名: {DEFAULT_ADMIN}");
-        warn!("    密码  : {password}");
-        warn!("  这条日志只出现一次，请立即保存。数据库里只有 argon2 哈希。");
-        warn!("──────────────────────────────────────────────────────────");
-    } else {
-        info!("已用 PULSE_ADMIN_PASSWORD 创建管理员 {DEFAULT_ADMIN}");
-    }
+    info!("已用 PULSE_ADMIN_PASSWORD 创建管理员 {username}");
     Ok(())
 }
 

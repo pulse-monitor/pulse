@@ -19,6 +19,7 @@ const REFRESH_COOKIE: &str = "pulse_refresh";
 
 pub fn routes() -> Router<Ctx> {
     Router::new()
+        .route("/api/v1/auth/setup", get(setup_status).post(setup))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
@@ -117,18 +118,30 @@ async fn login(
     ctx.limiter.record_success(ip);
 
     let now = now_unix();
+    let out = issue_session(&ctx, jar, &user.username)?;
+    let _ = ctx.store.touch_admin_login(user.id, now).await;
+    info!(%ip, user = %user.username, "登录成功");
+    Ok(out)
+}
+
+/// 签发 access + refresh，并把 refresh 放进 cookie。
+///
+/// 登录和首次初始化共用 —— 初始化完直接就是登录态，不该让用户刚设完
+/// 密码又立刻输一遍。
+fn issue_session(
+    ctx: &Ctx,
+    jar: CookieJar,
+    username: &str,
+) -> Result<(CookieJar, Json<LoginResp>), ApiError> {
+    let now = now_unix();
     let (access, _) = ctx
         .jwt
-        .issue(&user.username, TokenKind::Access, now)
+        .issue(username, TokenKind::Access, now)
         .map_err(|e| ApiError::internal("签发 access token", e))?;
     let (refresh, _) = ctx
         .jwt
-        .issue(&user.username, TokenKind::Refresh, now)
+        .issue(username, TokenKind::Refresh, now)
         .map_err(|e| ApiError::internal("签发 refresh token", e))?;
-
-    let _ = ctx.store.touch_admin_login(user.id, now).await;
-    info!(%ip, user = %user.username, "登录成功");
-
     Ok((
         jar.add(refresh_cookie(
             refresh,
@@ -139,6 +152,147 @@ async fn login(
             expires_in: ACCESS_TTL.as_secs(),
         }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// 首次初始化
+// ---------------------------------------------------------------------------
+
+/// 用户名允许的字符与长度。留得比较紧 —— 它会进日志和 JWT 的 sub。
+const USERNAME_MIN: usize = 3;
+const USERNAME_MAX: usize = 32;
+/// 与 `PULSE_ADMIN_PASSWORD` 的门槛保持一致，避免两条路径的规则不同。
+const PASSWORD_MIN: usize = 8;
+
+#[derive(Serialize)]
+pub struct SetupStatus {
+    /// true = 还没有任何管理员，前端该显示「创建管理员」而不是「登录」
+    needed: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetupReq {
+    username: String,
+    password: String,
+}
+
+/// 面板还需不需要初始化。
+///
+/// 公开可读，且**只回一个布尔**：它本来就能从「登录页长什么样」推出来，
+/// 藏着没有意义，反而会让前端得靠猜。
+async fn setup_status(State(ctx): State<Ctx>) -> ApiResult<Json<SetupStatus>> {
+    let n = ctx
+        .store
+        .count_admins()
+        .await
+        .map_err(|e| ApiError::internal("查询管理员数量", e))?;
+    Ok(Json(SetupStatus { needed: n == 0 }))
+}
+
+/// 创建第一个管理员，并直接进入登录态。
+///
+/// **安全边界**：这个接口在「一个管理员都没有」时对所有人开放，也就是说
+/// 从面板起来到有人完成初始化之间，谁先访问谁就是管理员。这是产品上要的
+/// 交互（装完点开就能用，不必去日志里翻密码），代价必须说清楚：
+///
+/// - 判空与写入是同一条 SQL（见 `create_first_admin`），不存在两个人都建成的情况；
+/// - 建成之后这个接口永久失效，返回 409；
+/// - 谁抢到了会以 warn 级别记下 IP 和用户名，事后能查；
+/// - 想完全关掉这个窗口的，可以在启动时给 `PULSE_ADMIN_PASSWORD`
+///   预先建好管理员，那样这里从一开始就是 409。
+///
+/// 所以安装脚本会把面板地址直接打出来，提示**立刻**完成初始化。
+async fn setup(
+    State(ctx): State<Ctx>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<SetupReq>,
+) -> ApiResult<(CookieJar, Json<LoginResp>)> {
+    let ip = client_ip(&headers, peer.ip(), ctx.config.trusted_proxy_hops);
+
+    // 顺序是有讲究的：**先挡掉不花钱的情况，再限流**。
+    //
+    // 限流器保护的是 argon2 —— 那才是能被放大成 DoS 的东西。而「已经初始化过」
+    // 和「用户名不合法」都是常数开销，让它们去消耗额度的话，初始化完的人
+    // 紧接着就会被自己刚才那几次请求挡在登录门外（实测过）。
+    if ctx
+        .store
+        .count_admins()
+        .await
+        .map_err(|e| ApiError::internal("查询管理员数量", e))?
+        > 0
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "ALREADY_INITIALIZED",
+            "面板已经初始化过了，请直接登录",
+        ));
+    }
+
+    let username = req.username.trim();
+    if !(USERNAME_MIN..=USERNAME_MAX).contains(&username.chars().count()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "BAD_USERNAME",
+            format!("用户名需要 {USERNAME_MIN}-{USERNAME_MAX} 个字符"),
+        ));
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "BAD_USERNAME",
+            "用户名只能包含字母、数字、下划线和连字符",
+        ));
+    }
+    // 按**字符数**而不是字节数算，否则中文密码会被高估长度
+    if req.password.chars().count() < PASSWORD_MIN {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "BAD_PASSWORD",
+            format!("密码至少需要 {PASSWORD_MIN} 个字符"),
+        ));
+    }
+
+    // 到这里才是真正花钱的一段：argon2 + 写库
+    if let Err(block) = ctx.limiter.check(ip, std::time::Instant::now()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            format!(
+                "请求过于频繁，请 {} 秒后再试",
+                block.retry_after().as_secs()
+            ),
+        ));
+    }
+
+    let hash =
+        auth::hash_password(&req.password).map_err(|e| ApiError::internal("计算密码哈希", e))?;
+
+    let created = ctx
+        .store
+        .create_first_admin(username, &hash, now_unix())
+        .await
+        .map_err(|e| ApiError::internal("创建管理员", e))?;
+
+    let Some(id) = created else {
+        warn!(%ip, "初始化被拒绝：管理员已存在");
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "ALREADY_INITIALIZED",
+            "面板已经初始化过了，请直接登录",
+        ));
+    };
+
+    // warn 而不是 info：这条是事后追责的锚点，不该淹在 info 里
+    warn!(%ip, user = %username, "面板已初始化，管理员由该 IP 创建");
+
+    let out = issue_session(&ctx, jar, username)?;
+    let _ = ctx.store.touch_admin_login(id, now_unix()).await;
+    Ok(out)
 }
 
 /// 用户不存在时用来消耗等量时间的假哈希。参数与真实哈希一致。

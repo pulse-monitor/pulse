@@ -120,7 +120,7 @@ pub struct InstallCommands {
 pub fn render(panel_url: &str, token: &str, o: &InstallOptions) -> InstallCommands {
     let http = panel_url.trim_end_matches('/');
     let ws = to_ws_url(http);
-    let img = "ghcr.io/<you>/pulse-agent:latest";
+    let img = "ghcr.io/pulse-monitor/pulse-agent:latest";
 
     let mut flags: Vec<String> = vec![
         format!("--server {ws}"),

@@ -1347,3 +1347,68 @@ async fn deleting_a_rule_cascades_to_its_alerts() {
         "规则删掉时告警记录应一并清理"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 首次初始化：create_first_admin 的原子性
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn first_admin_only_once() {
+    let (s, _d) = store().await;
+    assert_eq!(s.count_admins().await.unwrap(), 0);
+
+    let id = s.create_first_admin("alice", "hash-a", 100).await.unwrap();
+    assert!(id.is_some(), "第一个应该建得成");
+    assert_eq!(s.count_admins().await.unwrap(), 1);
+
+    // 换个用户名再来一次 —— 靠 UNIQUE(username) 是拦不住的，
+    // 必须靠 WHERE NOT EXISTS
+    let again = s.create_first_admin("bob", "hash-b", 200).await.unwrap();
+    assert!(again.is_none(), "已经有管理员了，第二个必须被拒");
+    assert_eq!(s.count_admins().await.unwrap(), 1);
+    assert!(s.get_admin("bob").await.unwrap().is_none());
+
+    let alice = s.get_admin("alice").await.unwrap().expect("alice 在");
+    assert_eq!(alice.password_hash, "hash-a");
+}
+
+#[tokio::test]
+async fn first_admin_blocked_by_existing_admin() {
+    let (s, _d) = store().await;
+    // 用无人值守那条路径（PULSE_ADMIN_PASSWORD）先建好
+    s.create_admin("admin", "hash-x", 1).await.unwrap();
+
+    let r = s.create_first_admin("attacker", "hash-y", 2).await.unwrap();
+    assert!(r.is_none(), "预先建过管理员，初始化接口就该是关的");
+    assert_eq!(s.count_admins().await.unwrap(), 1);
+}
+
+/// 并发调用只能有一个成功。
+///
+/// 这是这个方法存在的**唯一理由** —— 顺序调用用 count+insert 也能过，
+/// 只有并发才能把 TOCTOU 暴露出来。
+#[tokio::test]
+async fn first_admin_concurrent_single_winner() {
+    let dir = tempfile::tempdir().expect("建临时目录");
+    let url = format!("sqlite://{}/t.db", dir.path().display());
+    let s = std::sync::Arc::new(SqliteStore::open(&url).await.expect("打开数据库"));
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..8 {
+        let s = s.clone();
+        set.spawn(async move {
+            s.create_first_admin(&format!("user{i}"), "h", 1)
+                .await
+                .unwrap()
+                .is_some()
+        });
+    }
+    let mut wins = 0;
+    while let Some(r) = set.join_next().await {
+        if r.unwrap() {
+            wins += 1;
+        }
+    }
+    assert_eq!(wins, 1, "并发 8 个只能有 1 个建成，实际 {wins}");
+    assert_eq!(s.count_admins().await.unwrap(), 1);
+}

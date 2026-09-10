@@ -10,8 +10,8 @@ const DISMISS_KEY = 'pulse.visitor.dismissed'
  * 放在页脚居中，而不是浮在右下角 —— 浮窗会挡住卡片，而且这些信息
  * 本来就属于「页面元信息」。
  *
- * 隐私说明：这些信息**不被记录**，只在请求内计算并返回一次
- * 。字段缺失时不显示那一段，而不是显示「未知」。
+ * 隐私说明：这些信息**不被记录**，只在 GET /api/v1/public/visitor 的请求内
+ * 计算并返回一次。字段缺失时不显示那一段，而不是显示「未知」。
  */
 export function VisitorBadge() {
   const [v, setV] = useState<Awaited<ReturnType<typeof api.visitor>> | null>(null)

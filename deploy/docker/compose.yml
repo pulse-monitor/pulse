@@ -4,7 +4,7 @@
 
 services:
   server:
-    image: ghcr.io/<you>/pulse-server:latest
+    image: ghcr.io/pulse-monitor/pulse:latest
     restart: unless-stopped
     ports: ["25774:25774"]
     volumes:

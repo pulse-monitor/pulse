@@ -439,6 +439,36 @@ impl Storage for SqliteStore {
             .get(0))
     }
 
+    async fn create_first_admin(
+        &self,
+        username: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        // 判空与写入合成一条语句。WHERE NOT EXISTS 在 SQLite 里与 INSERT
+        // 同属一个隐式事务，写连接又是单条的，所以并发下最多只有一条能成
+        let res = sqlx::query(
+            "INSERT INTO admin_user (username, password_hash, created_at)
+             SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM admin_user)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(now)
+        .execute(&self.write)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Ok(None); // 已经有人抢先建过了
+        }
+        Ok(Some(
+            sqlx::query("SELECT id FROM admin_user WHERE username = ?")
+                .bind(username)
+                .fetch_one(&self.write)
+                .await?
+                .get(0),
+        ))
+    }
+
     async fn create_admin(&self, username: &str, password_hash: &str, now: i64) -> Result<i64> {
         sqlx::query(
             "INSERT INTO admin_user (username, password_hash, created_at) VALUES (?, ?, ?)",

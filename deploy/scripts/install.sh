@@ -35,7 +35,8 @@ NET_EXCLUDE=""
 DISABLE_AUTO_UPDATE=0
 ENABLE_GPU=0
 UNINSTALL=0
-DOWNLOAD_BASE="${PULSE_DOWNLOAD_BASE:-https://github.com/<you>/pulse/releases/download}"
+# 探针二进制在**探针仓库**的 Release 里，面板仓库不发探针
+DOWNLOAD_BASE="${PULSE_DOWNLOAD_BASE:-https://github.com/pulse-monitor/pulse-agent/releases/download}"
 # agent 自更新的下载源。留空 = 自更新关闭（capabilities.self_update 如实报 false）。
 UPDATE_BASE="${PULSE_UPDATE_BASE:-}"
 CA_CERT="${PULSE_CA_CERT:-}"

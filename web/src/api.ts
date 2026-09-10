@@ -219,6 +219,11 @@ export const api = {
       isp: string | null
       asn: number | null
     }>('/api/v1/public/visitor'),
+  /** 面板还需不需要初始化。公开可读。 */
+  setupStatus: () => get<{ needed: boolean }>('/api/v1/auth/setup'),
+  /** 创建第一个管理员。成功后**直接就是登录态**，不用再登一次。 */
+  setup: (username: string, password: string) =>
+    post<{ access_token: string; expires_in: number }>('/api/v1/auth/setup', { username, password }),
   login: (username: string, password: string) =>
     post<{ access_token: string; expires_in: number }>('/api/v1/auth/login', { username, password }),
   refresh: () => post<{ access_token: string; expires_in: number }>('/api/v1/auth/refresh'),

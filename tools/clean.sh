@@ -30,6 +30,16 @@ drop target/debug          # cargo test / cargo check 的产物，最大的一�
 drop target/release        # 本机 release —— 部署用的是 musl，这个没人要
 [ "$all" = 1 ] && drop target/x86_64-unknown-linux-musl || \
   echo "  留 target/x86_64-unknown-linux-musl（部署产物，--all 可一并删）"
+# 交叉编译产物。之前漏了，攒到 4 GB 才被发现 —— 所以这里不写死目标名，
+# 凡是 target/ 下的目标三元组目录一律按 --all 处理
+if [ "$all" = 1 ]; then
+  for d in target/*/; do
+    case "$(basename "$d")" in
+      debug|release|tmp|package|x86_64-unknown-linux-musl) ;;   # 上面已单独处理
+      *-*-*) drop "${d%/}" ;;                                   # 形如 x86_64-pc-windows-msvc
+    esac
+  done
+fi
 
 echo "=== 前端 ==="
 drop web/dist

@@ -141,8 +141,15 @@ pub fn render(panel_url: &str, token: &str, o: &InstallOptions) -> InstallComman
         flags.push(format!("--net-exclude '{}'", o.net_exclude.join(",")));
     }
 
+    // 一条命令同时适配 Debian 系与 Alpine。原生 Alpine **没有 curl、sudo、bash**
+    // （只有 busybox 的 wget 和 ash），原先的 `curl … | sudo bash` 在那上面一步都走不动：
+    // - 下载：curl 不在就退回 wget；
+    // - 提权：`$(command -v sudo)` 在有 sudo 时展开成 sudo，没有时为空 ——
+    //   Alpine 上通常本来就是 root；既非 root 又没 sudo 时，脚本自己会报「需要 root」；
+    // - 解释器：脚本是 POSIX sh，不需要 bash。
+    let url = format!("{http}/install.sh");
     let shell = format!(
-        "curl -fsSL {http}/install.sh | sudo bash -s -- \\\n  {}",
+        "(curl -fsSL {url} || wget -qO- {url}) \\\n  | $(command -v sudo) sh -s -- \\\n  {}",
         flags.join(" \\\n  ")
     );
 
@@ -152,10 +159,15 @@ pub fn render(panel_url: &str, token: &str, o: &InstallOptions) -> InstallComman
     );
 
     // Docker 方式需要三个参数才能看到宿主机的指标，但**不需要 --privileged**。
+    //
+    // 不要给 bind mount 加 `rslave`：它要求宿主机的 `/` 已经是
+    // shared/slave mount，而 Alpine（以及不少精简发行版）默认是 private，
+    // Docker 会在创建容器前直接报错。Agent 只需读取启动时可见的宿主文件系统，
+    // 不需要接收之后新增挂载点的传播。
     // 各参数去掉后的后果
     let docker = format!(
         "docker run -d --name pulse-agent --restart=always \\\n  \
-         --network host \\\n  --pid host \\\n  -v /:/rootfs:ro,rslave \\\n  \
+         --network host \\\n  --pid host \\\n  -v /:/rootfs:ro \\\n  \
          -e PULSE_SERVER={ws} \\\n  -e PULSE_TOKEN={token} \\\n  \
          -e PULSE_ROOTFS=/rootfs \\\n  {img}"
     );
@@ -167,7 +179,7 @@ pub fn render(panel_url: &str, token: &str, o: &InstallOptions) -> InstallComman
          restart: always\n    \
          network_mode: host\n    \
          pid: host\n    \
-         volumes:\n      - \"/:/rootfs:ro,rslave\"\n    \
+         volumes:\n      - \"/:/rootfs:ro\"\n    \
          environment:\n      \
          PULSE_SERVER: \"{ws}\"\n      \
          PULSE_TOKEN: \"{token}\"\n      \
@@ -179,12 +191,17 @@ pub fn render(panel_url: &str, token: &str, o: &InstallOptions) -> InstallComman
         powershell,
         docker,
         compose,
-        note: "**这台机器原来的 token 已经作废了**：库里只存哈希、取不回明文，\
-               所以每次生成安装命令都会换一把新钥匙。\
-               如果这台机器上已经装了探针，它会掉线，直到用下面的新命令重装。\
-               token 只显示这一次，请立即复制；命令里带着 token，执行后建议从 shell 历史中清除。\
-               安装需要 sudo（写 systemd unit、建专用用户），但 agent 运行时是非特权用户。"
-            .into(),
+        note: format!(
+            "**这台机器原来的 token 已经作废了**：库里只存哈希、取不回明文，\
+             所以每次生成安装命令都会换一把新钥匙。\
+             如果这台机器上已经装了探针，它会掉线，直到用下面的新命令重装。\
+             token 只显示这一次，请立即复制；命令里带着 token，执行后建议从 shell 历史中清除。\
+             安装需要 root（写服务定义、建专用用户；不是 root 时命令会自动走 sudo），\
+             但 agent 运行时是非特权用户。支持 systemd 与 OpenRC（Alpine）。\
+             **只是想升级已装的探针，不必来这里生成新命令**（那会让旧 token 作废）：\
+             在那台机器上执行 `(curl -fsSL {url} || wget -qO- {url}) | $(command -v sudo) sh -s --`，\
+             不带参数即沿用原 token 与配置、升到最新版；末尾加 `--uninstall` 就是卸载。"
+        ),
     }
 }
 
@@ -232,6 +249,14 @@ mod tests {
             c.docker.contains("--network host"),
             "Docker 需要 host 网络才能看到宿主机网卡"
         );
+        assert!(
+            c.docker.contains("-v /:/rootfs:ro"),
+            "Docker 需要只读挂载宿主根目录才能采集宿主磁盘"
+        );
+        assert!(
+            !c.docker.contains("rslave") && !c.compose.contains("rslave"),
+            "rslave 要求宿主根目录是 shared/slave，在 Alpine 上会导致 Docker 创建失败"
+        );
         assert!(!c.docker.contains("--privileged"), "绝不能要求 privileged");
     }
 
@@ -251,6 +276,29 @@ mod tests {
             "提示要说明已装的探针会掉线：{}",
             c.note
         );
+    }
+
+    #[test]
+    fn shell_命令在原生_alpine_上也能跑() {
+        // 原生 Alpine 没有 curl / sudo / bash。命令里任何一个写死，
+        // 贴过去就是 `not found`，一步都走不动。
+        let c = render("https://p", "T", &InstallOptions::default());
+        assert!(
+            c.shell.contains("wget -qO-"),
+            "curl 不在时要能退回 wget：{}",
+            c.shell
+        );
+        assert!(
+            c.shell.contains("$(command -v sudo)"),
+            "sudo 不能写死：{}",
+            c.shell
+        );
+        assert!(
+            !c.shell.contains("bash"),
+            "脚本是 POSIX sh，不该依赖 bash：{}",
+            c.shell
+        );
+        assert!(c.shell.contains("sh -s --"), "{}", c.shell);
     }
 
     #[test]
@@ -318,7 +366,9 @@ mod tests {
         // 清理之后生成的命令里不能再有注入痕迹
         let c = render("https://p", "T", &o);
         assert!(!c.shell.contains("rm -rf"));
-        assert!(!c.shell.contains("$("));
+        assert!(!c.shell.contains("$(id)"));
+        // 命令里唯一的命令替换是我们自己写的 `$(command -v sudo)`
+        assert_eq!(c.shell.matches("$(").count(), 1, "{}", c.shell);
     }
 
     #[test]
@@ -331,6 +381,19 @@ mod tests {
         for bad in ["", "a b", "a;b", "$(x)", "`x`", "a\nb", &"x".repeat(65)] {
             assert!(!is_safe_pattern(bad), "不该接受 {bad:?}");
         }
+    }
+
+    #[test]
+    fn 提示里要告诉用户升级和卸载不需要新_token() {
+        // 升级不该走「生成安装命令」：那会让旧 token 作废、机器先掉线
+        let c = render("https://p.example.com", "T", &InstallOptions::default());
+        assert!(c.note.contains("升级"), "{}", c.note);
+        assert!(
+            c.note.contains("https://p.example.com/install.sh"),
+            "升级命令要带上真实的面板地址，能直接复制：{}",
+            c.note
+        );
+        assert!(c.note.contains("--uninstall"), "{}", c.note);
     }
 
     #[test]

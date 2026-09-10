@@ -64,14 +64,35 @@ Agent 只做两件事：**采集**、**上报**。它不开放入站端口、不
 
 ## 装起来
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/pulse-monitor/pulse/main/deploy/scripts/install-server.sh \
-  | sudo bash -s -- --url https://panel.example.com
+```sh
+U=https://raw.githubusercontent.com/pulse-monitor/pulse/main/deploy/scripts/install-server.sh
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- --url https://panel.example.com
 ```
+
+同一条命令适用于 Debian / Ubuntu / RHEL 系（systemd）和 Alpine（OpenRC）—— 原生 Alpine 没有 curl、sudo、bash，所以下载会退回 wget，没有 sudo 时直接以 root 执行。
 
 装完打开面板，**第一个访问的人设定自己的用户名和密码** —— 安装时不带密码参数，也不用去日志里翻。所以装完请立刻去设置。
 
 添加服务器后，后台会生成对应的 Agent 安装命令，贴到目标机器上执行即可。
+
+### 探针升级 / 卸载
+
+在**探针所在的机器**上执行（`U` 换成你的面板地址；Debian 系与 Alpine 通用，root 下不需要 sudo）：
+
+```sh
+U=https://panel.example.com/install.sh
+
+# 升级到最新版：不带任何参数，沿用机器上原有的 token 与配置
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s --
+
+# 卸载：停服务、删服务定义、二进制、配置、日志与专用用户
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- --uninstall
+```
+
+- 升级**不要**去后台重新「生成安装命令」—— 那会让旧 token 当场作废，机器先掉线。
+- 指定版本：末尾加 `--version 0.0.4`。
+- 面板已经不在了也能卸：把 `U` 换成 `https://raw.githubusercontent.com/pulse-monitor/pulse/main/deploy/scripts/install.sh`。
+- 用 Docker 跑的探针：`docker pull` 新镜像后 `docker rm -f pulse-agent` 再按原命令 `docker run`；卸载就是 `docker rm -f pulse-agent`。
 
 ### Docker
 

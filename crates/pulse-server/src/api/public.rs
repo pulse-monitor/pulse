@@ -11,7 +11,7 @@ use super::{ApiError, ApiResult, Ctx, PublicMode};
 use crate::state::now_unix;
 use crate::store::ServerId;
 
-/// 安装脚本内嵌进二进制，这样 `curl https://panel/install.sh | sudo bash` 就能用，
+/// 安装脚本内嵌进二进制，这样 `curl https://panel/install.sh | sudo sh` 就能用，
 /// 不需要额外的静态文件服务。脚本在仓库里可审计，也鼓励用户先下载看一眼再执行。
 const INSTALL_SH: &str = include_str!("../../../../deploy/scripts/install.sh");
 const INSTALL_PS1: &str = include_str!("../../../../deploy/windows/install-service.ps1");

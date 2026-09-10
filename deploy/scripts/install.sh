@@ -2,23 +2,32 @@
 # ---------------------------------------------------------------------------
 # Pulse 探针安装脚本。
 #
-# 需要 root（写 systemd unit、建专用用户），但**装完之后 agent 以非特权用户运行**。
+# 需要 root（写服务定义、建专用用户），但**装完之后 agent 以非特权用户运行**。
+# 支持 systemd 与 OpenRC（Alpine）。
 # 这个区别很重要，
 #
 # 这个脚本用 root 权限只做四件事：
 #   1. 建专用系统用户 pulse（非登录）
 #   2. 下载并校验二进制，放到 /var/lib/pulse-agent/bin/
-#   3. 写 systemd unit 与 /etc/pulse-agent/env（0600）
+#   3. 写 systemd unit（或 OpenRC 的 /etc/init.d 脚本）与 /etc/pulse-agent/env（0600）
 #   4. enable + start 服务
 # 它**不会**：改 sysctl、改防火墙、装额外的包、动 .bashrc、上传任何信息。
 #
-# 用法：
-#   curl -fsSL https://panel/install.sh | sudo bash -s -- --server wss://panel --token XXX
-#   sh install.sh --uninstall
+# 用法（U=https://面板地址/install.sh；Debian 系与 Alpine 通用）：
+#   安装：(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- --server wss://面板 --token XXX
+#   升级：(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s --
+#         已装过的机器**不带参数**重跑即可：沿用 /etc/pulse-agent/env 里的 token 与配置，
+#         下载最新版。指定版本用 --version 0.0.4。
+#   卸载：(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- --uninstall
 # ---------------------------------------------------------------------------
 set -eu
 
-VERSION="0.0.1"
+# 探针版本。留空 = 装 Release 里的最新版。
+#
+# 原先这里写死 "0.0.1"：新装的机器拿到的永远是最老的版本，
+# 已装的机器重跑安装命令也还是 0.0.1 —— 「升级」实际上从来没生效过。
+VERSION="${PULSE_AGENT_VERSION:-}"
+AGENT_REPO="${PULSE_AGENT_REPO:-pulse-monitor/pulse-agent}"
 SERVICE="pulse-agent"
 RUN_USER="pulse"
 STATE_DIR="/var/lib/pulse-agent"
@@ -35,6 +44,8 @@ NET_EXCLUDE=""
 DISABLE_AUTO_UPDATE=0
 ENABLE_GPU=0
 UNINSTALL=0
+# 是否显式给了运行期选项。没给、也没给 --server/--token 时，升级会原样保留现有配置
+CONF_FLAGS=0
 # 探针二进制在**探针仓库**的 Release 里，面板仓库不发探针
 DOWNLOAD_BASE="${PULSE_DOWNLOAD_BASE:-https://github.com/pulse-monitor/pulse-agent/releases/download}"
 # agent 自更新的下载源。留空 = 自更新关闭（capabilities.self_update 如实报 false）。
@@ -71,29 +82,30 @@ while [ $# -gt 0 ]; do
         --server)       SERVER="${2:?--server 需要一个值}"; shift 2 ;;
         --token)        TOKEN="${2:?--token 需要一个值}"; shift 2 ;;
         --install-dir)  INSTALL_DIR="${2:?}"; shift 2 ;;
-        --interval)     INTERVAL="${2:?}"; shift 2 ;;
-        --net-include)  NET_INCLUDE="${2:?}"; shift 2 ;;
-        --net-exclude)  NET_EXCLUDE="${2:?}"; shift 2 ;;
-        --disable-auto-update) DISABLE_AUTO_UPDATE=1; shift ;;
-        --enable-gpu)   ENABLE_GPU=1; shift ;;
+        --version)      VERSION="${2:?--version 需要一个值，如 0.0.4}"; shift 2 ;;
+        --interval)     INTERVAL="${2:?}"; CONF_FLAGS=1; shift 2 ;;
+        --net-include)  NET_INCLUDE="${2:?}"; CONF_FLAGS=1; shift 2 ;;
+        --net-exclude)  NET_EXCLUDE="${2:?}"; CONF_FLAGS=1; shift 2 ;;
+        --disable-auto-update) DISABLE_AUTO_UPDATE=1; CONF_FLAGS=1; shift ;;
+        --enable-gpu)   ENABLE_GPU=1; CONF_FLAGS=1; shift ;;
         # 自建镜像源时用。**必须是参数而不能只靠 PULSE_DOWNLOAD_BASE** ——
         # 安装命令是 `curl … | sudo bash` 的形式，sudo 默认会清掉环境变量，
         # 环境变量那条路在真机上根本走不通（实测踩过）。
         --download-base) DOWNLOAD_BASE="${2:?}"; shift 2 ;;
         # 自更新的下载源。不设则 agent 的自更新不可用，面板会如实显示。
-        --update-base)  UPDATE_BASE="${2:?}"; shift 2 ;;
+        --update-base)  UPDATE_BASE="${2:?}"; CONF_FLAGS=1; shift 2 ;;
         # 面板用私有 CA / 自签证书时，额外信任的根证书（PEM）。
         # 只是往信任集里**加**一条，不会放松其它连接的校验。
-        --ca-cert)      CA_CERT="${2:?}"; shift 2 ;;
+        --ca-cert)      CA_CERT="${2:?}"; CONF_FLAGS=1; shift 2 ;;
         --uninstall)    UNINSTALL=1; shift ;;
         -h|--help)
-            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) die "未知参数: $1（用 --help 看用法）" ;;
     esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "需要 root 权限。请用 sudo 运行 —— 但装完之后 agent 是以非特权用户 $RUN_USER 跑的。"
+[ "$(id -u)" -eq 0 ] || die "需要 root 权限。请用 root 或 sudo/doas 运行 —— 但装完之后 agent 是以非特权用户 $RUN_USER 跑的。"
 
 # CA 证书路径当场校验。等到探针起来连不上才报「读不到 CA 证书」，
 # 用户还得去翻 journalctl —— 装的时候就该拦住。
@@ -142,7 +154,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
     exit 0
 fi
 
-[ -n "$SERVER" ] || die "缺少 --server"
+# ── 升级：没给 --server / --token 就沿用这台机器现有的配置 ──────────────────
+# token 只在生成安装命令时显示一次，而且面板上重新生成会让旧 token 当场作废
+# （机器先掉线）。只是想升级探针的话，不该逼人去面板再要一把新钥匙。
+# 什么都没给 → 配置文件原样保留（连同 --update-base、--ca-cert 这些当初的选项）；
+# 给了任何一项 → 以给的为准，缺的 server/token 从现有配置补。
+REUSE_CONF=0
+if [ -r "$CONF_DIR/env" ]; then
+    [ -z "$SERVER" ] && [ -z "$TOKEN" ] && [ "$CONF_FLAGS" -eq 0 ] && REUSE_CONF=1
+    [ -n "$SERVER" ] || SERVER=$(sed -n 's/^PULSE_SERVER=//p' "$CONF_DIR/env" | tail -1)
+    [ -n "$TOKEN" ]  || TOKEN=$(sed -n 's/^PULSE_TOKEN=//p' "$CONF_DIR/env" | tail -1)
+fi
+[ -n "$SERVER" ] || die "缺少 --server（首次安装需要；已装过的机器不带参数重跑就是升级）"
 [ -n "$TOKEN" ]  || die "缺少 --token"
 case "$INIT" in
     systemd|openrc) ;;
@@ -157,6 +180,27 @@ case "$(uname -m)" in
 esac
 ASSET="pulse-agent-${ARCH}-unknown-linux-musl"
 say "平台: linux/$ARCH，init: $INIT"
+
+# ── 下载工具（原生 Alpine 没有 curl，只有 busybox 的 wget）─────────────────
+fetch() {
+    if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
+    else die "需要 curl 或 wget"; fi
+}
+fetch_out() {
+    if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"
+    elif command -v wget >/dev/null 2>&1; then wget -qO- "$1"
+    else die "需要 curl 或 wget"; fi
+}
+
+# ── 版本：没指定就取最新。在动系统之前定下来，查不到就什么都不改 ──────────────
+if [ -z "$VERSION" ]; then
+    VERSION=$(fetch_out "https://api.github.com/repos/$AGENT_REPO/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$VERSION" ] || die "查不到探针的最新版本（GitHub API 不通或被限流）。用 --version 指定，如 --version 0.0.4"
+fi
+VERSION=${VERSION#v}
+say "探针版本: v$VERSION"
 
 # ── 幂等：已安装则走升级路径 ────────────────────────────────────────────────
 UPGRADE=0
@@ -190,7 +234,8 @@ else
           || die "创建用户失败"
     else
         # Debian 的 adduser（perl 脚本版）
-        adduser --system --no-create-home --shell "$NOLOGIN" \
+        # 必须带 --group：不带的话用户会被放进 nogroup，下面的 install -g 就找不到组
+        adduser --system --group --no-create-home --shell "$NOLOGIN" \
           --home "$STATE_DIR" "$RUN_USER" || die "创建用户失败"
     fi
 fi
@@ -200,12 +245,6 @@ install -d -m 0750 "$CONF_DIR"
 
 # ── 下载并校验 ─────────────────────────────────────────────────────────────
 TMP=$(mktemp -d)
-
-fetch() {
-    if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
-    else die "需要 curl 或 wget"; fi
-}
 
 say "下载 $ASSET"
 fetch "$DOWNLOAD_BASE/v$VERSION/$ASSET" "$TMP/agent" \
@@ -228,6 +267,10 @@ if fetch "$DOWNLOAD_BASE/v$VERSION/SHA256SUMS" "$TMP/sums" 2>/dev/null; then
     fi
 else
     warn "取不到 SHA256SUMS，跳过校验（生产环境不该出现这种情况）"
+fi
+
+if [ -f "$BIN_DIR/pulse-agent" ] && cmp -s "$TMP/agent" "$BIN_DIR/pulse-agent" 2>/dev/null; then
+    say "已经是 v$VERSION，二进制没有变化（服务定义照样刷新并重启）"
 fi
 
 # ── 危险操作前备份 ─────────────────────────────────────────────────────────
@@ -254,6 +297,9 @@ install -m 0755 -o "$RUN_USER" -g "$RUN_USER" "$TMP/agent" "$BIN_DIR/pulse-agent
 
 # ── 配置。token 写文件不进命令行 —— 命令行对同机任何用户 ps 可见 ──────────
 umask 077
+if [ "$REUSE_CONF" -eq 1 ]; then
+    say "沿用现有配置 $CONF_DIR/env（token 与当初的选项都不变）"
+else
 {
     echo "PULSE_SERVER=$SERVER"
     echo "PULSE_TOKEN=$TOKEN"
@@ -266,6 +312,7 @@ umask 077
     [ -n "$CA_CERT" ] && echo "PULSE_CA_CERT=$CA_CERT"
     echo "PULSE_INTERVAL=$INTERVAL"
 } > "$CONF_DIR/env"
+fi
 chmod 0600 "$CONF_DIR/env"
 
 # 探针以非特权用户运行，读不到 CA 证书一样连不上。装完当场验一次，
@@ -367,6 +414,9 @@ command_background=false
 supervisor=supervise-daemon
 respawn_delay=5
 respawn_max=0
+# 这两条 OpenRC 给得了，对应 systemd 的 NoNewPrivileges=yes 与 UMask=0077
+no_new_privs=yes
+umask=0077
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/${RC_SVCNAME}.log"
 error_log="/var/log/${RC_SVCNAME}.log"
@@ -394,7 +444,7 @@ fi
 
 start_pre() {
     checkpath -d -m 0750 -o __RUN_USER__:__RUN_USER__ "__STATE_DIR__"
-    checkpath -f -m 0644 -o __RUN_USER__:__RUN_USER__ "/var/log/${RC_SVCNAME}.log"
+    checkpath -f -m 0640 -o __RUN_USER__:__RUN_USER__ "/var/log/${RC_SVCNAME}.log"
     if [ ! -r "$cfgfile" ]; then
         eerror "配置文件不存在或不可读: $cfgfile"
         return 1
@@ -426,8 +476,22 @@ is_running() {
     if [ "$INIT" = systemd ]; then
         systemctl is-active --quiet "$SERVICE"
     else
-        rc-service "$SERVICE" status 2>/dev/null | grep -q started
+        # 只看 status 不够：supervise-daemon 自己活着就报 started，哪怕 agent
+        # 一起来就崩、正在 respawn_delay 里等重启。所以还要确认 agent 进程在，
+        # 且隔两秒还是同一个 pid —— 没有陷在崩溃循环里。
+        rc-service "$SERVICE" status 2>/dev/null | grep -q started || return 1
+        p1=$(agent_pid)
+        [ -n "$p1" ] || return 1
+        sleep 2
+        [ "$(agent_pid)" = "$p1" ]
     fi
+}
+
+# supervise-daemon 把被监管进程的 pid 记在 OpenRC 的服务状态里
+agent_pid() {
+    p=$(cat "/run/openrc/options/$SERVICE/child_pid" 2>/dev/null || true)
+    [ -n "$p" ] && [ -d "/proc/$p" ] && echo "$p"
+    return 0
 }
 
 i=0
@@ -435,7 +499,8 @@ while [ "$i" -lt 30 ]; do
     if is_running; then
         rm -rf "$TMP"; TMP=""; trap - EXIT
         printf '\n%s✔ 安装完成%s\n' "$GRN" "$RST"
-        [ "$UPGRADE" -eq 1 ] && printf '  （升级，已保留原配置的备份）\n'
+        [ "$UPGRADE" -eq 1 ] && printf '  （升级到 v%s，已备份原二进制与配置）\n' "$VERSION"
+        [ "$UPGRADE" -eq 0 ] && printf '  版本    : v%s\n' "$VERSION"
         printf '  运行身份: %s（非 root）\n' "$RUN_USER"
         printf '  二进制  : %s\n' "$BIN_DIR/pulse-agent"
         printf '  配置    : %s (0600)\n' "$CONF_DIR/env"
@@ -450,8 +515,24 @@ while [ "$i" -lt 30 ]; do
             printf '         等都是 systemd 特有）。这里保证的是**非 root 专用用户运行**，\n'
             printf '         其余的命名空间与系统调用限制在 OpenRC 下没有等价物。\n'
         fi
-        printf '  确认无端口: ss -lntp | grep pulse   （应无输出）\n'
-        printf '  卸载    : sh install.sh --uninstall\n'
+        # Alpine 默认没有 iproute2 的 ss，busybox 的 netstat 能做同样的事
+        if command -v ss >/dev/null 2>&1; then
+            printf '  确认无端口: ss -lntp | grep pulse   （应无输出）\n'
+        else
+            printf '  确认无端口: netstat -lntp | grep pulse   （应无输出）\n'
+        fi
+        # 用管道装的机器上**没有 install.sh 这个文件**，原先提示的
+        # `sh install.sh --uninstall` 照着敲只会报找不到文件。给能直接复制的完整命令。
+        case "$SERVER" in
+            wss://*) PANEL="https://${SERVER#wss://}" ;;
+            ws://*)  PANEL="http://${SERVER#ws://}" ;;
+            *)       PANEL="$SERVER" ;;
+        esac
+        U="${PANEL%/}/install.sh"
+        # shellcheck disable=SC2016
+        printf '\n  升级    : (curl -fsSL %s || wget -qO- %s) | $(command -v sudo) sh -s --\n' "$U" "$U"
+        # shellcheck disable=SC2016
+        printf '  卸载    : (curl -fsSL %s || wget -qO- %s) | $(command -v sudo) sh -s -- --uninstall\n' "$U" "$U"
         exit 0
     fi
     i=$((i + 1))

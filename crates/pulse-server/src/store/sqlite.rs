@@ -1649,11 +1649,28 @@ impl Storage for SqliteStore {
                     .push_bind(r.sent)
                     .push_bind(r.recv);
             });
-            qb.push(
-                " ON CONFLICT(server_id, task_id, ts) DO UPDATE SET
-                  rtt_avg = excluded.rtt_avg, rtt_min = excluded.rtt_min,
-                  rtt_max = excluded.rtt_max, sent = excluded.sent, recv = excluded.recv",
-            );
+            qb.push(match layer {
+                // raw 层**累加**而不是覆盖。agent 每 30 秒 flush 一次，探测间隔
+                // 小于 60 秒时，同一分钟的结果会分两批到。原先这里是覆盖，
+                // 后到的半分钟把先到的半分钟整个抹掉 —— 丢包和延迟都只剩一半样本。
+                // agent 不会重发已送出的批次，所以累加不会重复计数。
+                // 多参数的 MIN/MAX 遇 NULL 返回 NULL，用 COALESCE 交叉兜底。
+                PingLayer::Raw => {
+                    " ON CONFLICT(server_id, task_id, ts) DO UPDATE SET
+                      rtt_avg = CASE WHEN recv + excluded.recv = 0 THEN NULL ELSE
+                          (COALESCE(rtt_avg, 0) * recv + COALESCE(excluded.rtt_avg, 0) * excluded.recv)
+                          / (recv + excluded.recv) END,
+                      rtt_min = MIN(COALESCE(rtt_min, excluded.rtt_min), COALESCE(excluded.rtt_min, rtt_min)),
+                      rtt_max = MAX(COALESCE(rtt_max, excluded.rtt_max), COALESCE(excluded.rtt_max, rtt_max)),
+                      sent = sent + excluded.sent, recv = recv + excluded.recv"
+                }
+                // 上卷层由上卷任务整桶重算后写入，覆盖才对（重跑不能翻倍）
+                _ => {
+                    " ON CONFLICT(server_id, task_id, ts) DO UPDATE SET
+                      rtt_avg = excluded.rtt_avg, rtt_min = excluded.rtt_min,
+                      rtt_max = excluded.rtt_max, sent = excluded.sent, recv = excluded.recv"
+                }
+            });
             total += qb.build().execute(&mut *tx).await?.rows_affected();
         }
         tx.commit().await?;

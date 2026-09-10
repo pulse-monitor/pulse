@@ -3,6 +3,8 @@
 //! **只有这一个接口。** agent 侧没有任何其他可调的服务端接口，
 //! 服务端也没有任何可调的 agent 接口。
 
+use std::time::Duration;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -10,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Instant};
 use tracing::{debug, info, warn};
 
 use super::{bearer, client_ip, Ctx};
@@ -17,6 +20,20 @@ use crate::auth::token_hash;
 use crate::state::now_unix;
 use crate::store::{PingLayer, PingRow, ServerFacts, ServerRecord};
 use pulse_proto::{AgentMsg, ServerMsg, Welcome, WS_SUBPROTOCOL};
+
+/// 每隔这么久主动给 agent 发一个 Ping。
+///
+/// 跨境长链路（德国面板 ↔ 港台 agent）上连接会被中间设备**静默掐断**：
+/// 不发 RST、包直接黑洞。原先两边都没有心跳，服务端只读不写，
+/// 于是这条死连接会一直挂着 —— 既不报错也不退出。
+const HEARTBEAT: Duration = Duration::from_secs(20);
+/// 这么久没收到 agent 的任何帧（指标、Pong 都算）就判定连接已死。
+///
+/// 老版本 agent 不会主动发 Ping，但 tungstenite 会自动回 Pong，
+/// 所以上面的心跳对老 agent 一样有效，不会误杀。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单次写的上限。链路黑洞时写会卡在 TCP 重传上，默认要十几分钟才报错。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn routes() -> Router<Ctx> {
     Router::new().route("/api/v1/agent/ws", get(agent_ws))
@@ -59,9 +76,10 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
     info!(id, name = %server.name, %ip, "agent 已连接");
 
     // 同一 token 只允许一个连接：新连接会把旧的挤掉。
-    // 这里靠替换 state 里的发送端实现 —— 旧任务下次发送时会失败并退出。
+    // 实现是替换 state 里的发送端 —— 旧连接的 rx 随之关闭，它的循环据此退出。
+    // 返回的 conn 是这条连接的代号，断开时凭它注销，见 on_disconnect。
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
-    ctx.state.on_connect(&uuid, tx.clone());
+    let conn = ctx.state.on_connect(&uuid, tx.clone());
     ctx.state.set_db_id(&uuid, id);
     // GeoIP：**按连入的 IP 判国家**，不用后台手填。
     // `location_manual` 为真表示用户自己填过坐标/国家，那就以他为准 ——
@@ -103,18 +121,35 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
         Ok(_) => {}
         Err(e) => warn!(id, "读取探测任务失败: {e}"),
     }
+    // 本地这份发送端必须放掉。留着的话 rx 永远不会关闭 ——
+    // 新连接替换掉 state 里的发送端之后，旧连接察觉不到自己已被取代，
+    // 只能挂在一条（多半已经死了的）socket 上干等。
+    drop(tx);
 
     let (mut sink, mut stream) = {
         use futures_util::StreamExt;
         socket.split()
     };
 
+    let mut heartbeat = tokio::time::interval_at(Instant::now() + HEARTBEAT, HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_rx = Instant::now();
+
     loop {
         tokio::select! {
             // ── 下行：后台改配置时通过 channel 立刻推下去 ──
             out = rx.recv() => {
                 use futures_util::SinkExt;
-                let Some(msg) = out else { break };
+                let Some(msg) = out else {
+                    // 发送端全没了 = 同一 token 的新连接已经顶替了这一条
+                    info!(id, "已被同一 token 的新连接取代，关闭旧连接");
+                    let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::NORMAL,
+                        reason: "replaced by a newer connection".into(),
+                    }));
+                    let _ = timeout(WRITE_TIMEOUT, sink.send(close)).await;
+                    break;
+                };
                 // 错误不吞：序列化失败过一次（内部标签枚举装 Vec），
                 // 当时这里是 `let Ok(..) else { continue }`，表现成
                 // 「服务端说发了、agent 说没收到」，查了很久
@@ -125,8 +160,22 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
                         continue;
                     }
                 };
-                if sink.send(Message::Text(txt.into())).await.is_err() {
-                    warn!(id, "下发失败，连接已断");
+                if !matches!(timeout(WRITE_TIMEOUT, sink.send(Message::Text(txt.into()))).await, Ok(Ok(()))) {
+                    warn!(id, "下发失败或超时，连接已断");
+                    break;
+                }
+            }
+
+            // ── 心跳：顺带检查对端是否还活着 ──
+            _ = heartbeat.tick() => {
+                use futures_util::SinkExt;
+                let idle = last_rx.elapsed();
+                if idle > IDLE_TIMEOUT {
+                    warn!(id, idle_s = idle.as_secs(), "心跳超时：长时间没收到 agent 的任何数据，判定连接已死");
+                    break;
+                }
+                if !matches!(timeout(WRITE_TIMEOUT, sink.send(Message::Ping(Default::default()))).await, Ok(Ok(()))) {
+                    warn!(id, "发送心跳失败或超时，连接已断");
                     break;
                 }
             }
@@ -138,6 +187,8 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
                     Ok(m) => m,
                     Err(e) => { warn!(id, "读取失败: {e}"); break; }
                 };
+                // 任何帧都算活着，包括 Pong
+                last_rx = Instant::now();
                 match msg {
                     Message::Text(txt) => match serde_json::from_str::<AgentMsg>(txt.as_str()) {
                         Ok(AgentMsg::Hello(h)) => {
@@ -188,19 +239,18 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
                             if let Err(e) = ctx.store.insert_ping(PingLayer::Raw, &rows).await {
                                 warn!(id, "写入延迟结果失败: {e}");
                             }
-                            // 顺手在内存里留一份最新结果：服务器卡片要显示
-                            // 延迟/丢包（R16），而首页不允许查库
-                            if let Some(r) = rs.iter().max_by_key(|r| r.ts) {
-                                ctx.state.on_ping(&uuid, crate::state::LatencyView {
-                                    task_id: i64::from(r.task_id),
-                                    rtt_ms: r.rtt_avg_us.map(|v| f64::from(v) / 1000.0).unwrap_or(0.0),
-                                    loss_pct: if r.sent > 0 {
-                                        f64::from(r.sent - r.recv) * 100.0 / f64::from(r.sent)
-                                    } else {
-                                        0.0
-                                    },
-                                });
-                            }
+                            // 顺手在内存里留一份：服务器卡片要显示延迟/丢包（R16），
+                            // 而首页不允许查库。**整批都交给 state**，由它按窗口汇总 ——
+                            // 只取最新一条的话，多任务时卡片永远只看得到其中一个，
+                            // 单分钟 3 个包的丢包率也几乎总是 0。
+                            let samples: Vec<_> = rs.iter().map(|r| crate::state::PingSample {
+                                task_id: i64::from(r.task_id),
+                                ts: r.ts,
+                                sent: u32::from(r.sent),
+                                recv: u32::from(r.recv),
+                                rtt_avg_us: r.rtt_avg_us,
+                            }).collect();
+                            ctx.state.on_ping(&uuid, &samples);
                             if rs.iter().any(|r| r.fallback) {
                                 debug!(id, "该机器的 ICMP 任务已回落 TCP");
                             }
@@ -209,12 +259,14 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
                         Err(e) => warn!(id, "无法解析 agent 消息，已忽略: {e}"),
                     },
                     Message::Close(_) => break,
-                    _ => {} // Ping 由 axum 自动回 Pong
+                    _ => {} // Ping 由 axum 自动回 Pong；Pong 只用来刷新 last_rx
                 }
             }
         }
     }
 
     info!(id, "agent 已断开");
-    ctx.state.on_disconnect(&uuid);
+    // 带上连接代号：如果这条已经被新连接顶替，这里什么都不会做 ——
+    // 否则旧连接迟到的断开会把正在正常上报的新连接标成离线
+    ctx.state.on_disconnect(&uuid, conn);
 }

@@ -537,6 +537,51 @@ async fn ping_rollup_survives_total_packet_loss() {
 }
 
 #[tokio::test]
+async fn raw_ping_同一分钟分两批写入要累加而不是覆盖() {
+    // agent 每 30 秒 flush 一次，探测间隔 < 60 秒时同一分钟会分两批到。
+    // 原先 ON CONFLICT 是覆盖：后一批把前一批整个抹掉
+    let (s, _d) = store().await;
+    let id = server(&s, "n").await;
+    let t = 1_700_000_000 / 60 * 60;
+    let row = |rtt: Option<i64>, sent, recv| PingRow {
+        server_id: id,
+        task_id: 1,
+        ts: t,
+        rtt_avg: rtt,
+        rtt_min: rtt.map(|v| v - 100),
+        rtt_max: rtt.map(|v| v + 100),
+        sent,
+        recv,
+    };
+
+    s.insert_ping(PingLayer::Raw, &[row(Some(1000), 3, 3)])
+        .await
+        .unwrap();
+    s.insert_ping(PingLayer::Raw, &[row(Some(3000), 3, 1)])
+        .await
+        .unwrap();
+    // 第三批全丢包：rtt 为 NULL，不能把已有的 min/max 冲成 NULL
+    s.insert_ping(PingLayer::Raw, &[row(None, 3, 0)])
+        .await
+        .unwrap();
+
+    let series = s.query_ping(id, 1, t - 60, t + 60).await.unwrap();
+    assert_eq!(series.ts, vec![t]);
+    let loss = series.loss_pct[0].unwrap();
+    assert!(
+        (loss - 5.0 * 100.0 / 9.0).abs() < 0.01,
+        "9 个包收到 4 个，丢包应为 55.6%，实际 {loss}"
+    );
+    assert_eq!(
+        series.rtt_avg[0],
+        Some(1500),
+        "rtt 按 recv 加权：(1000×3 + 3000×1) / 4"
+    );
+    assert_eq!(series.rtt_min[0], Some(900));
+    assert_eq!(series.rtt_max[0], Some(3100));
+}
+
+#[tokio::test]
 async fn prune_deletes_only_expired_rows() {
     let (s, _d) = store().await;
     let id = server(&s, "n").await;

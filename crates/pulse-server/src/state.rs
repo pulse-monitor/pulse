@@ -23,6 +23,40 @@ pub const RING_CAP: usize = 300;
 /// 再多也看不出来，而每台机器多存一个点就是 200 个 f32。
 const SPARK_CAP: usize = 20;
 
+/// 卡片上的延迟/丢包按最近多久的探测结果汇总。
+///
+/// 只看「最新一条」是不行的：一轮通常只发 3 个包，单分钟的丢包率只能是
+/// 0 / 33 / 67 / 100%，偶发丢包绝大多数时候读到的都是 0 —— 详情页按多分钟
+/// 聚合看得到丢包，卡片却一直显示 0（用户实报）。
+const CARD_WINDOW_S: i64 = 600;
+/// 窗口里最多留多少条（任务 × 分钟）。20 个任务 × 10 分钟 = 200，留点余量
+const CARD_WINDOW_CAP: usize = 512;
+
+/// 连接代号发号器。每条 agent 连接一个，用来区分「当前连接」和「已被顶替的旧连接」。
+static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// agent 上报的一条探测结果（某任务某分钟），供卡片汇总用。
+#[derive(Debug, Clone, Copy)]
+pub struct PingSample {
+    pub task_id: i64,
+    /// 分钟对齐
+    pub ts: i64,
+    pub sent: u32,
+    pub recv: u32,
+    pub rtt_avg_us: Option<u32>,
+}
+
+/// 窗口里的一格：同一任务同一分钟的累计。rtt 存「总和」而不是平均，
+/// 这样合并时直接相加，按 recv 加权是自然的结果。
+#[derive(Debug, Clone, Copy)]
+struct WindowSlot {
+    task_id: i64,
+    ts: i64,
+    sent: u64,
+    recv: u64,
+    rtt_sum_us: u64,
+}
+
 /// 离线判定的宽限：`interval × 3 + 10s`。M0/M1 的 interval 为 2 秒。
 const OFFLINE_GRACE_S: i64 = 2 * 3 + 10;
 
@@ -62,6 +96,10 @@ pub struct ServerEntry {
     /// 只放内存、有界（[`SPARK_CAP`]）—— 卡片上那条走势图不值得为它查一次库，
     /// 200 台机器每次刷新都查一遍历史会把读连接吃光。
     pub spark: VecDeque<(f32, f32)>,
+    /// 最近 [`CARD_WINDOW_S`] 秒的探测结果，卡片的延迟/丢包由它汇总
+    ping_window: VecDeque<WindowSlot>,
+    /// 当前连接的代号。旧连接断开时代号对不上，就不能动这台机器的在线状态
+    conn_id: u64,
     /// 通往该 agent 的 WS 发送端。断开时置 None。
     ///
     /// 有了它，后台改配置才能**立刻推下去**而不是等 agent 下次重连 ——
@@ -88,6 +126,8 @@ impl ServerEntry {
             review_url: None,
             latency: None,
             spark: VecDeque::with_capacity(SPARK_CAP),
+            ping_window: VecDeque::new(),
+            conn_id: 0,
             tx: None,
         }
     }
@@ -372,18 +412,31 @@ impl AppState {
         Self::default()
     }
 
-    pub fn on_connect(&self, uuid: &str, tx: mpsc::UnboundedSender<ServerMsg>) {
+    /// 登记一条新连接，返回它的代号。断开时要凭这个代号注销。
+    pub fn on_connect(&self, uuid: &str, tx: mpsc::UnboundedSender<ServerMsg>) -> u64 {
+        let conn = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut e = self
             .inner
             .entry(uuid.to_string())
             .or_insert_with(|| ServerEntry::new(uuid.to_string()));
         e.connected = true;
         e.tx = Some(tx);
+        e.conn_id = conn;
         e.last_seen = now_unix();
+        conn
     }
 
-    pub fn on_disconnect(&self, uuid: &str) {
+    /// 注销一条连接。**代号对不上就什么都不做。**
+    ///
+    /// 跨境链路上常见的时序：旧连接被静默掐断 → agent 重连成功（新连接）→
+    /// 过了一阵旧连接才终于报错退出。原先这里不认代号，旧连接一退出就把
+    /// 这台机器置成离线、发送端清空 —— 而新连接明明还在正常上报，
+    /// 面板上却一直显示离线，直到 agent 下次重连（用户实报的「运行一会儿就断开」）。
+    pub fn on_disconnect(&self, uuid: &str, conn: u64) {
         if let Some(mut e) = self.inner.get_mut(uuid) {
+            if e.conn_id != conn {
+                return;
+            }
             e.connected = false;
             // 丢掉发送端，否则后台改配置时会往一条死连接里写
             e.tx = None;
@@ -476,15 +529,48 @@ impl AppState {
         e.last_seen = now_unix();
     }
 
-    /// 记录最近一次延迟探测结果，供服务器卡片显示（R16）。
-    pub fn on_ping(&self, uuid: &str, l: LatencyView) {
-        if let Some(mut e) = self.inner.get_mut(uuid) {
-            if e.spark.len() == SPARK_CAP {
-                e.spark.pop_front();
+    /// 收下一批探测结果，重新汇总卡片上的延迟/丢包（R16）。
+    pub fn on_ping(&self, uuid: &str, samples: &[PingSample]) {
+        let Some(mut e) = self.inner.get_mut(uuid) else {
+            return;
+        };
+        for s in samples {
+            let rtt_sum = u64::from(s.rtt_avg_us.unwrap_or(0)) * u64::from(s.recv);
+            // 同一分钟可能被 agent 拆成两批上报（它每 30 秒 flush 一次），要累加不能覆盖
+            if let Some(w) = e
+                .ping_window
+                .iter_mut()
+                .find(|w| w.task_id == s.task_id && w.ts == s.ts)
+            {
+                w.sent += u64::from(s.sent);
+                w.recv += u64::from(s.recv);
+                w.rtt_sum_us += rtt_sum;
+            } else {
+                e.ping_window.push_back(WindowSlot {
+                    task_id: s.task_id,
+                    ts: s.ts,
+                    sent: u64::from(s.sent),
+                    recv: u64::from(s.recv),
+                    rtt_sum_us: rtt_sum,
+                });
             }
-            e.spark.push_back((l.rtt_ms as f32, l.loss_pct as f32));
-            e.latency = Some(l);
         }
+        // 窗口以最新一条的时间为锚，而不是服务器时钟 —— 不受两边时钟偏差影响
+        let Some(newest) = e.ping_window.iter().map(|w| w.ts).max() else {
+            return;
+        };
+        e.ping_window.retain(|w| w.ts > newest - CARD_WINDOW_S);
+        while e.ping_window.len() > CARD_WINDOW_CAP {
+            e.ping_window.pop_front();
+        }
+        let Some(l) = card_view(&e.ping_window) else {
+            return;
+        };
+        if e.spark.len() == SPARK_CAP {
+            e.spark.pop_front();
+        }
+        e.spark.push_back((l.rtt_ms as f32, l.loss_pct as f32));
+        e.latency = Some(l);
     }
 
     /// 同步 servers 表里那些前端要用、但不来自 agent 的字段。
@@ -737,6 +823,38 @@ fn to_public(e: &ServerEntry, now: i64) -> PublicServer {
     }
 }
 
+/// 卡片上显示哪个探测点：**窗口内丢包最严重的那个**，延迟也取它的，
+/// 两个数字始终来自同一个真实目标。都不丢包时取 task_id 最小的，
+/// 免得卡片在几个目标之间来回跳。
+///
+/// 原先是「整批里 ts 最大的那一条」—— 多任务时永远落在同一个任务上，
+/// 丢包出在别的目标时卡片上根本看不到。
+fn card_view(w: &VecDeque<WindowSlot>) -> Option<LatencyView> {
+    let mut per: std::collections::BTreeMap<i64, (u64, u64, u64)> = Default::default();
+    for s in w {
+        let a = per.entry(s.task_id).or_default();
+        a.0 += s.sent;
+        a.1 += s.recv;
+        a.2 += s.rtt_sum_us;
+    }
+    per.into_iter()
+        .filter(|(_, (sent, _, _))| *sent > 0)
+        .map(|(task_id, (sent, recv, rtt_sum))| LatencyView {
+            task_id,
+            rtt_ms: if recv > 0 {
+                rtt_sum as f64 / recv as f64 / 1000.0
+            } else {
+                0.0
+            },
+            loss_pct: sent.saturating_sub(recv) as f64 * 100.0 / sent as f64,
+        })
+        // BTreeMap 按 task_id 升序；只有严格更大才替换，所以并列时留下 id 最小的
+        .fold(None, |best: Option<LatencyView>, v| match best {
+            Some(b) if v.loss_pct <= b.loss_pct => Some(b),
+            _ => Some(v),
+        })
+}
+
 /// 百分比，分母为 0 时返回 0 而不是 NaN —— NaN 序列化成 JSON 会变成 null，
 /// 前端的 `.toFixed` 会直接崩。
 fn pct(used: u64, total: u64) -> f32 {
@@ -803,7 +921,7 @@ mod tests {
         let id = derive_id("tok");
         assert_eq!(st.summary().total, 0);
 
-        st.on_connect(&id, mpsc::unbounded_channel().0);
+        let conn = st.on_connect(&id, mpsc::unbounded_channel().0);
         st.on_hello(&id, hello());
         st.on_metrics(&id, metrics(now_unix(), 1234));
 
@@ -814,8 +932,126 @@ mod tests {
         assert!((list[0].cpu_pct - 12.34).abs() < 0.01);
         assert!(list[0].uptime_s >= 3600, "uptime 应由 boot_at 反推");
 
-        st.on_disconnect(&id);
+        st.on_disconnect(&id, conn);
         assert_eq!(st.summary().online, 0, "断开必须立刻离线，不等超时");
+    }
+
+    #[test]
+    fn 旧连接迟到的断开不能把新连接踢成离线() {
+        // 跨境链路：旧连接被静默掐断 → agent 重连 → 旧连接过一阵才报错退出
+        let st = AppState::new();
+        let id = derive_id("tok");
+        // 接收端要留着，否则 push_config 必然失败，测不出发送端有没有被清掉
+        let (tx_old, _rx_old) = mpsc::unbounded_channel();
+        let (tx_new, _rx_new) = mpsc::unbounded_channel();
+        let old = st.on_connect(&id, tx_old);
+        let new = st.on_connect(&id, tx_new);
+        st.on_metrics(&id, metrics(now_unix(), 1));
+
+        st.on_disconnect(&id, old);
+        assert_eq!(st.summary().online, 1, "旧连接退出不能影响新连接");
+        assert!(
+            st.push_config(&id, RuntimeConfig::default()),
+            "新连接的发送端不能被旧连接的退出清掉"
+        );
+
+        st.on_disconnect(&id, new);
+        assert_eq!(st.summary().online, 0);
+    }
+
+    fn sample(task_id: i64, ts: i64, sent: u32, recv: u32, rtt_us: u32) -> PingSample {
+        PingSample {
+            task_id,
+            ts,
+            sent,
+            recv,
+            rtt_avg_us: (recv > 0).then_some(rtt_us),
+        }
+    }
+
+    fn card(st: &AppState, id: &str) -> LatencyView {
+        st.list()
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.latency)
+            .expect("应当有延迟视图")
+    }
+
+    #[test]
+    fn 卡片丢包按窗口汇总_不能只看最新一分钟() {
+        // 用户实报：详情页有丢包，卡片一直是 0。
+        // 每分钟 3 个包，偶尔丢一个 —— 最新那一分钟几乎总是 0
+        let st = AppState::new();
+        let id = derive_id("tok");
+        st.on_connect(&id, mpsc::unbounded_channel().0);
+        let t0 = 1_700_000_000 / 60 * 60;
+        for i in 0..10 {
+            let recv = if i == 3 { 2 } else { 3 };
+            st.on_ping(&id, &[sample(1, t0 + i * 60, 3, recv, 50_000)]);
+        }
+        let l = card(&st, &id);
+        assert!(
+            (l.loss_pct - 100.0 / 30.0).abs() < 0.01,
+            "10 分钟 30 个包丢 1 个应为 3.33%，实际 {}",
+            l.loss_pct
+        );
+        assert!((l.rtt_ms - 50.0).abs() < 0.01);
+
+        // 超出窗口的丢包不再计入
+        for i in 10..20 {
+            st.on_ping(&id, &[sample(1, t0 + i * 60, 3, 3, 50_000)]);
+        }
+        assert_eq!(card(&st, &id).loss_pct, 0.0, "10 分钟前的丢包应滚出窗口");
+    }
+
+    #[test]
+    fn 卡片取丢包最严重的探测点_并列时取最小_id() {
+        let st = AppState::new();
+        let id = derive_id("tok");
+        st.on_connect(&id, mpsc::unbounded_channel().0);
+        let t = 1_700_000_000 / 60 * 60;
+
+        // 都不丢包：稳定显示 task 1，不管它在批里排第几
+        st.on_ping(&id, &[sample(2, t, 3, 3, 9_000), sample(1, t, 3, 3, 1_000)]);
+        let l = card(&st, &id);
+        assert_eq!((l.task_id, l.loss_pct), (1, 0.0));
+        assert!((l.rtt_ms - 1.0).abs() < 0.01);
+
+        // task 2 开始丢包：卡片要显示它，延迟也是它的
+        st.on_ping(
+            &id,
+            &[sample(1, t + 60, 3, 3, 1_000), sample(2, t + 60, 3, 0, 0)],
+        );
+        let l = card(&st, &id);
+        assert_eq!(l.task_id, 2, "丢包出在 task 2，卡片却在看 task 1");
+        assert!(
+            (l.loss_pct - 50.0).abs() < 0.01,
+            "task 2：6 个包丢 3 个，实际 {}",
+            l.loss_pct
+        );
+        assert!((l.rtt_ms - 9.0).abs() < 0.01, "延迟应取同一个目标的");
+    }
+
+    #[test]
+    fn 同一分钟分两批上报要累加() {
+        // agent 每 30 秒 flush 一次，探测间隔小于 60 秒时同一分钟会分两批到
+        let st = AppState::new();
+        let id = derive_id("tok");
+        st.on_connect(&id, mpsc::unbounded_channel().0);
+        let t = 1_700_000_000 / 60 * 60;
+        st.on_ping(&id, &[sample(1, t, 3, 3, 1_000)]);
+        st.on_ping(&id, &[sample(1, t, 3, 1, 5_000)]);
+        let l = card(&st, &id);
+        assert!(
+            (l.loss_pct - 100.0 / 3.0).abs() < 0.01,
+            "6 个包丢 2 个，实际 {}",
+            l.loss_pct
+        );
+        assert!(
+            (l.rtt_ms - 2.0).abs() < 0.01,
+            "rtt 按 recv 加权：(1×3+5×1)/4 = 2，实际 {}",
+            l.rtt_ms
+        );
     }
 
     #[test]
@@ -833,7 +1069,7 @@ mod tests {
         // agent 进程卡死：WS 还连着，但不再上报
         let st = AppState::new();
         let id = derive_id("tok");
-        st.on_connect(&id, mpsc::unbounded_channel().0);
+        let _ = st.on_connect(&id, mpsc::unbounded_channel().0);
         st.inner.get_mut(&id).unwrap().last_seen = now_unix() - (OFFLINE_GRACE_S + 1);
         assert_eq!(st.summary().online, 0);
     }

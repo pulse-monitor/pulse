@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-loadgen"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-proto"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-server"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aes-gcm",
  "anyhow",

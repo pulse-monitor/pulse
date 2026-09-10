@@ -6,26 +6,34 @@
 
 # ── 前端 ──
 #
-# 前端在**另一个仓库**（pulse-web），这里按 ref 克隆后现场构建，而不是去下
-# Release 包：镜像构建和前端发版就不必互相等，main 分支也随时构得出来。
+# 前端在**另一个仓库**（pulse-web），这里下它的 Release 产物。
 #
-# --platform=$BUILDPLATFORM：产物是一堆静态文件，**与目标架构无关**。
-# 不写的话 buildx 会为每个目标架构各构一遍，其中一遍跑在 QEMU 模拟层里，
-# npm ci + vite build 在模拟下慢 5-10 倍，纯属白费。
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
-ARG PULSE_WEB_REPO=https://github.com/pulse-monitor/pulse-web.git
-# 默认跟 main。要复现某个历史镜像就把它固定到 tag 或 commit
-ARG PULSE_WEB_REF=main
-# ca-certificates 不能省：slim 镜像里没有根证书，git 会直接
-# "server certificate verification failed. CAfile: none" 而不是给个能懂的错
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# 早先是 `git clone --branch main` 现场构建，那样有两个毛病：
+#
+#   1. **镜像里是哪个版本的前端，取决于「构建那一刻 main 长什么样」** ——
+#      事后无从查证，也没法复现某个历史镜像。
+#   2. **buildx 的层缓存会骗人**：clone 那一层的缓存键只看命令文本，
+#      main 往前走了它照样命中，于是新提交根本进不了镜像。
+#      实测踩到：修复提交比镜像构建早 16 分钟，镜像里却还是旧代码。
+#
+# 现在钉死版本号，改版本必须改这里 —— 显式、可复现、缓存也骗不了人。
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS web
+ARG PULSE_WEB_VERSION=0.0.5
+ARG PULSE_WEB_REPO=pulse-monitor/pulse-web
+RUN apk add --no-cache curl tar
 WORKDIR /web
-RUN git clone --depth 1 --branch "$PULSE_WEB_REF" "$PULSE_WEB_REPO" . \
- || (git clone "$PULSE_WEB_REPO" . && git checkout "$PULSE_WEB_REF")
-RUN npm ci
-# prebuild 会从 node_modules 里生成国旗与地图数据
-RUN npm run build
+# 摘要要校验：下到半截或被中间人换掉都得当场失败，而不是打进镜像。
+#（注意不能把 # 注释写进下面的续行里 —— shell 会把 # 之后到行尾整个吃掉）
+RUN set -eux; \
+    base="https://github.com/${PULSE_WEB_REPO}/releases/download/v${PULSE_WEB_VERSION}"; \
+    curl -fsSL "$base/pulse-web-dist.tar.gz" -o dist.tgz; \
+    curl -fsSL "$base/SHA256SUMS" -o sums; \
+    want=$(awk '/pulse-web-dist\.tar\.gz$/{print $1}' sums | head -1); \
+    got=$(sha256sum dist.tgz | awk '{print $1}'); \
+    [ "$want" = "$got" ] || { echo "前端产物摘要不符: 期望 $want 实际 $got" >&2; exit 1; }; \
+    tar xzf dist.tgz; \
+    rm -f dist.tgz sums; \
+    test -f dist/index.html
 
 # ── 后端 ──
 #

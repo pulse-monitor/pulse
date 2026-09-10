@@ -36,6 +36,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # --locked：Cargo.lock 必须已经是最新的。
+      #
+      # 镜像构建用的就是 --locked，而 CI 的其他步骤不用 —— 于是改了版本号
+      # 却忘了同步 lock 时，CI 一路绿灯、Docker 构建单独挂掉，而且要等十几分钟
+      # 才看得到（实测踩过两次）。放在最前面，几秒就能拦住。
+      - run: cargo metadata --locked --format-version 1 > /dev/null
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 

@@ -73,7 +73,23 @@ curl -fsSL https://raw.githubusercontent.com/pulse-monitor/pulse/main/deploy/scr
 
 添加服务器后，后台会生成对应的 Agent 安装命令，贴到目标机器上执行即可。
 
-Docker、反向代理、HTTPS 见[文档](https://pulse-doc.pages.dev/install/quick-start)。
+### Docker
+
+```bash
+docker run -d --name pulse -p 25774:25774 -v pulse-data:/data \
+  -e PULSE_PUBLIC_URL=https://panel.example.com \
+  ghcr.io/pulse-monitor/pulse:latest
+```
+
+镜像也发在 `jinqians/pulse-server`，`linux/amd64` 与 `linux/arm64` 都有。
+
+### 不想开入站端口
+
+用 [Cloudflare Tunnel](https://pulse-doc.pages.dev/install/config#cloudflare-tunnel-cloudflared)，
+Pulse 只监听 `127.0.0.1`，整台机器可以对公网完全关闭 ——
+这和 Agent 主动外连的方向是一致的。
+
+反向代理、HTTPS、自签证书见[文档](https://pulse-doc.pages.dev/install/quick-start)。
 
 ## 存储
 

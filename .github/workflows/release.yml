@@ -49,22 +49,27 @@ jobs:
           # 换公钥必须重新编译并重装 agent。
           # 它是公钥，放在 secret 里只是为了避免不同环境构建出不同产物。
           PULSE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+          # 经 env 传进来而不是直接把 ${{ }} 拼进脚本：模板替换发生在 shell
+          # 之前，拼进去等于让外部值参与构造命令行
+          TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [[ "${{ matrix.target }}" == *linux* ]]; then
-            cargo zigbuild --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
+          if [[ "$TARGET" == *linux* ]]; then
+            cargo zigbuild --release --target "$TARGET" -p pulse-agent -p pulse-server
           else
-            cargo build --release --target ${{ matrix.target }} -p pulse-agent -p pulse-server
+            cargo build --release --target "$TARGET" -p pulse-agent -p pulse-server
           fi
       - name: 收集产物
+        env:
+          TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p dist
-          ext=""; case "${{ matrix.target }}" in *windows*) ext=".exe";; esac
-          cp "target/${{ matrix.target }}/release/pulse-agent$ext"  "dist/pulse-agent-${{ matrix.target }}$ext"
-          cp "target/${{ matrix.target }}/release/pulse-server$ext" "dist/pulse-server-${{ matrix.target }}$ext"
+          ext=""; case "$TARGET" in *windows*) ext=".exe";; esac
+          cp "target/$TARGET/release/pulse-agent$ext"  "dist/pulse-agent-$TARGET$ext"
+          cp "target/$TARGET/release/pulse-server$ext" "dist/pulse-server-$TARGET$ext"
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}

@@ -1,0 +1,28 @@
+# 构建上下文里只该有源码。没有这个文件时上下文是 9.6 GB（target/ 占 9.5 GB），
+# 本地根本构不动；而且宿主机的产物被 COPY . . 拷进 Linux builder 还会干扰 cargo。
+target/
+**/node_modules/
+web/dist/
+
+.git/
+.github/
+.vscode/
+.idea/
+
+# 文档与脚本不参与构建
+docs/
+*.md
+!crates/pulse-server/migrations/README.md
+
+# 本地数据与产物
+*.db
+*.db-wal
+*.db-shm
+data/
+dist/
+*.log
+
+# macOS / iCloud
+.DS_Store
+._*
+*\ [0-9].*

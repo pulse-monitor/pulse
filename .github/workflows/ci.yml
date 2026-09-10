@@ -16,6 +16,16 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # workflow 文件本身也要检。语法/上下文错误不会让某个 job 变红 ——
+  # 整个 workflow 直接解析失败、**一个 job 都不起**，页面上只看到一条
+  # 没有任何日志的 failure。实际踩过：secrets 上下文在 step 的 if: 里不可用。
+  workflows:
+    name: Workflow 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2
+
   rust:
     name: Rust（格式 / clippy / 测试）
     runs-on: ubuntu-latest

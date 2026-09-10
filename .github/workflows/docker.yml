@@ -18,6 +18,10 @@ jobs:
   build:
     name: 构建并推送镜像
     runs-on: ubuntu-latest
+    # secrets 上下文在 step 的 if: 里用不了 —— 写了会让整个 workflow 解析失败、
+    # 一个 job 都起不来。所以在这里中转成 env，下面的 if 判 env
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,11 +41,11 @@ jobs:
       # 拿不到别人的密钥而一片红
       - name: 登录 Docker Hub
         id: dockerhub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
         continue-on-error: true
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 计算标签
@@ -50,7 +54,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            ${{ (steps.dockerhub.outcome == 'success' && format('{0}/pulse-server', secrets.DOCKERHUB_USERNAME)) || '' }}
+            ${{ (steps.dockerhub.outcome == 'success' && format('{0}/pulse-server', env.DOCKERHUB_USERNAME)) || '' }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}

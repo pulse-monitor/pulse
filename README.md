@@ -27,6 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/pulse-monitor/pulse/main/deploy/scr
   | sudo bash -s -- --url https://panel.example.com
 ```
 
+装完打开面板，**第一个访问的人设定自己的用户名和密码** —— 安装时不带密码参数，
+也不用去日志里翻。所以装完请立刻去设置。
+
 **探针** —— 后台加机器后点「安装命令」，把生成的命令贴到目标机器上。
 
 Docker、反向代理、HTTPS 等见[文档](https://pulse-doc.pages.dev/install/quick-start)。
@@ -53,19 +56,30 @@ VPS。如果探针听命于面板，攻陷面板就等于攻陷所有机器。�
 还有一条贯穿全局的规则：**采不到的指标如实标记为不可用，不显示 0**。一个写着
 「温度 0°C」的面板比没有这一项更糟 —— 它让你以为自己知道。
 
-## 技术栈
+## 仓库
 
-| | |
-|---|---|
-| 后端 | Rust · axum · tokio · sqlx（SQLite / PostgreSQL）· rustls |
-| 前端 | React 19 · TypeScript · Tailwind v4 · uPlot · Vite |
-| 探针 | Rust · 静态链接 musl · 三平台独立采集实现 |
+本仓库是**面板**（server），协议定义也在这里。另外两块各自独立发版：
+
+| 仓库 | 内容 | 技术栈 |
+|---|---|---|
+| **pulse**（这里） | 面板 + 协议定义 | Rust · axum · tokio · sqlx（SQLite / PostgreSQL）· rustls |
+| [pulse-web](https://github.com/pulse-monitor/pulse-web) | 面板前端 | React 19 · TypeScript · Tailwind v4 · uPlot · Vite |
+| [pulse-agent](https://github.com/pulse-monitor/pulse-agent) | 探针 | Rust · 静态链接 musl · 三平台独立采集实现 |
+| [pulse-docs](https://github.com/pulse-monitor/pulse-docs) | 文档站 | VitePress |
+
+探针按 tag 引用这里的 `pulse-proto`。**改协议要记得给 proto 打新 tag**，
+否则探针那边取不到 —— 面板发版时 Release workflow 会自动打。
 
 ## 构建
 
 ```bash
-cargo build --release                    # 面板 + 探针
-cd web && npm install && npm run build   # 前端
+cargo build --release        # 面板
+```
+
+面板要靠 `PULSE_WEB_DIR` 提供静态文件，本地开发时指向 pulse-web 的产物：
+
+```bash
+PULSE_WEB_DIR=../pulse-web/dist cargo run -p pulse-server
 ```
 
 跨平台用 `cargo zigbuild`，项目结构和开发约定见[开发指南](https://pulse-doc.pages.dev/dev/build)。

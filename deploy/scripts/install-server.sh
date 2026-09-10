@@ -9,7 +9,8 @@
 #                      **装在公网上必须给**，安装命令要靠它生成
 #   --bind <地址:端口>  监听地址，默认 0.0.0.0:25774
 #   --dir <目录>        安装目录，默认 /opt/pulse
-#   --version <版本>    指定版本，默认取最新
+#   --version <版本>    指定面板版本，默认取最新
+#   --web-version <版本> 指定前端版本（前端是独立仓库，自己发版），默认取最新
 #   --tls-cert <路径>   证书；和 --tls-key 一起给就直接跑 HTTPS
 #   --tls-key <路径>
 #   --uninstall        卸载（**保留数据目录**）
@@ -23,6 +24,7 @@ DIR=/opt/pulse
 BIND=0.0.0.0:25774
 URL=""
 VERSION=""
+WEB_VERSION=""   # 前端版本，独立于面板；留空取前端仓库的 latest
 TLS_CERT=""
 TLS_KEY=""
 UNINSTALL=0
@@ -39,6 +41,7 @@ while [ $# -gt 0 ]; do
         --bind)      BIND="${2:?}"; shift 2 ;;
         --dir)       DIR="${2:?}"; shift 2 ;;
         --version)   VERSION="${2:?}"; shift 2 ;;
+        --web-version) WEB_VERSION="${2:?}"; shift 2 ;;
         --tls-cert)  TLS_CERT="${2:?}"; shift 2 ;;
         --tls-key)   TLS_KEY="${2:?}"; shift 2 ;;
         --uninstall) UNINSTALL=1; shift ;;
@@ -84,14 +87,35 @@ fi
 say "版本 $VERSION"
 
 BASE="https://github.com/$REPO/releases/download/v$VERSION"
+# 前端在另一个仓库，自己发自己的版。默认取它的 latest —— 前端是纯静态资源，
+# 和面板之间只有 HTTP 接口这一层契约，不必锁死版本。要锁就用 --web-version。
+WEB_REPO="${PULSE_WEB_REPO:-pulse-monitor/pulse-web}"
+if [ -z "$WEB_VERSION" ]; then
+    WEB_VERSION=$(curl -fsSL "https://api.github.com/repos/$WEB_REPO/releases/latest" \
+        | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$WEB_VERSION" ] || die "拿不到前端最新版本号，用 --web-version 指定"
+fi
+WEB_BASE="https://github.com/$WEB_REPO/releases/download/v$WEB_VERSION"
+say "前端版本 $WEB_VERSION"
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 say "下载面板与前端"
 curl -fsSL "$BASE/pulse-server-$ARCH-unknown-linux-musl" -o "$TMP/pulse-server" \
     || die "下载失败：$BASE/pulse-server-$ARCH-unknown-linux-musl"
-curl -fsSL "$BASE/web-dist.tar.gz" -o "$TMP/web.tar.gz" \
-    || die "下载前端失败：$BASE/web-dist.tar.gz"
+curl -fsSL "$WEB_BASE/pulse-web-dist.tar.gz" -o "$TMP/web.tar.gz" \
+    || die "下载前端失败：$WEB_BASE/pulse-web-dist.tar.gz"
+
+# 前端也核对摘要 —— 它和面板不是同一个 Release，得单独查
+if curl -fsSL "$WEB_BASE/SHA256SUMS" -o "$TMP/websums" 2>/dev/null; then
+    wwant=$(awk '/pulse-web-dist\.tar\.gz$/{print $1}' "$TMP/websums" | head -1)
+    if [ -n "$wwant" ]; then
+        wgot=$(sha256sum "$TMP/web.tar.gz" | awk '{print $1}')
+        [ "$wwant" = "$wgot" ] || die "前端摘要不符：期望 $wwant，实际 $wgot"
+        say "前端摘要校验通过"
+    fi
+fi
 
 # 校验摘要。清单里没有对应条目时只警告不中断 —— 早期版本可能没传
 if curl -fsSL "$BASE/SHA256SUMS" -o "$TMP/sums" 2>/dev/null; then

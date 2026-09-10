@@ -39,9 +39,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Linux / Windows 用 zigbuild 从 ubuntu 交叉编译；
-  # **Apple 目标必须在 macOS runner 上原生编** —— 链接要用 Xcode SDK，
-  # zig 提供不了（实测：`xcrun --show-sdk-path` 找不到，链接直接失败）。
+  # 面板只发 Linux 二进制（它跑在你自己的服务器上），但 musl 静态链接
+  # 要交叉编译：ring 的 build script 需要目标平台的 C 编译器，zig 一个顶五个。
   cross-linux:
     name: 交叉编译（${{ matrix.target }}）
     runs-on: ubuntu-latest
@@ -59,94 +58,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # ring 的 build script 要目标平台的 C 编译器，zig 一个顶五个
       - uses: mlugg/setup-zig@v2
       - run: cargo install cargo-zigbuild --locked
       - run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
 
-  # Windows 同样要原生编：zigbuild 顶不了 MSVC 工具链。
-  #
-  # 本地想验 Windows 代码的话用 `cargo zigbuild --target x86_64-pc-windows-gnu
-  # --workspace --all-targets` —— gnu 目标 zig 能顶，够用来发现
-  # `#[cfg(windows)]` 里的编译错误，不必等 CI。
-  cross-windows:
-    name: 交叉编译（x86_64-pc-windows-msvc）
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  cross-apple:
-    name: 交叉编译（${{ matrix.target }}）
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }} --workspace
-      # macOS 上有原生工具链，可以顺便按目标跑 clippy。
-      # 平台专有代码只有这样才查得到 —— `System::boot_time` 少写一对括号
-      # （把函数指针当成时间戳）就是这么发现的
-      - run: cargo clippy --target ${{ matrix.target }} --workspace --all-targets -- -D warnings
-
-  frontend:
-    name: 前端（类型 / 单测 / 构建 / 首屏预算）
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npx tsc --noEmit
-      - run: npx vitest run
-      - run: npm run build
-      # 首屏预算是硬约束，超了就 fail
-      - name: 检查首屏体积 ≤ 180 KB gzip
-        run: |
-          set -Eeuo pipefail
-          total=0
-          for f in dist/assets/index-*.js dist/assets/index-*.css; do
-            [ -e "$f" ] || continue
-            sz=$(gzip -c "$f" | wc -c)
-            echo "  $(basename "$f")  $((sz / 1024)) KB gzip"
-            total=$((total + sz))
-          done
-          echo "首屏合计 $((total / 1024)) KB gzip（预算 180 KB）"
-          [ "$total" -le $((180 * 1024)) ] || { echo "❌ 超出首屏预算"; exit 1; }
-
   security:
-    name: 安全（R18 断言 / 依赖审计）
+    name: 安全（迁移不可变 / 依赖审计）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # R18：探针不提权、不能远程执行。这些断言是机器可检的部分。
-      - run: bash tools/check-agent-hardening.sh
       # 已发布的迁移文件改一个字节，已部署的实例就全部起不来（sqlx 校验和）
       - run: bash tools/check-migrations.sh
       - run: cargo install cargo-audit cargo-deny --locked
       # 安全公告 + 许可证 + 「被忽略项的前提是否仍然成立」
       - run: bash tools/check-deps.sh
+
+  # 探针的安装脚本由面板内嵌并提供（include_str! + GET /install.sh），
+  # 所以它跟着面板走、也在这里检查
+  scripts:
+    name: 安装脚本（shellcheck）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck deploy/scripts/*.sh tools/*.sh

@@ -1,8 +1,8 @@
 # 构建上下文里只该有源码。没有这个文件时上下文是 9.6 GB（target/ 占 9.5 GB），
 # 本地根本构不动；而且宿主机的产物被 COPY . . 拷进 Linux builder 还会干扰 cargo。
 target/
+# 前端在另一个仓库，镜像构建时现场克隆 —— 这里没有 web/
 **/node_modules/
-web/dist/
 
 .git/
 .github/

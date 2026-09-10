@@ -50,6 +50,7 @@ die() { printf '%s错误:%s %s\n' "$RED" "$RST" "$1" >&2; exit 1; }
 # 错误不吞：任何一步失败都要留下痕迹，而不是静默退出。
 # （不打行号 —— trap 里的 $LINENO 是 trap 自己的位置，反而误导）
 TMP=""
+# shellcheck disable=SC2329  # 由下面的 `trap on_exit EXIT` 调用
 on_exit() {
     st=$?
     [ -n "$TMP" ] && rm -rf "$TMP"
@@ -203,7 +204,11 @@ if [ -f "$BIN_DIR/pulse-agent" ]; then
     say "已备份旧二进制: pulse-agent.bak.$STAMP"
     # 只留最近 3 份。每次重装都留一个 2.3 MB 的备份且从不清理的话，
     # 反复升级的机器上会攒出一堆没人会去看的旧二进制（真机实测攒到过 2 份）。
-    ls -1t "$BIN_DIR"/pulse-agent.bak.* 2>/dev/null | tail -n +4 | while read -r old; do
+    # 文件名里的 STAMP 是 %Y%m%d%H%M%S，按名字倒序就是按时间倒序 ——
+    # 不必去解析 ls 的输出（文件名里有空格时那是不安全的）
+    printf '%s\n' "$BIN_DIR"/pulse-agent.bak.* | sort -r | tail -n +4 | while read -r old; do
+        # glob 没匹配到东西时 printf 会原样吐出这个模式，挡一下
+        [ -e "$old" ] || continue
         rm -f "$old" && say "清理过期备份: $(basename "$old")"
     done
 fi

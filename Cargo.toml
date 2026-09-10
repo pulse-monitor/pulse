@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/pulse-proto", "crates/pulse-agent", "crates/pulse-server", "crates/pulse-loadgen"]
+# 探针在 https://github.com/pulse-monitor/pulse-agent —— 它按 tag 引用这里的
+# pulse-proto。改协议时记得给 proto 打新 tag，否则探针那边取不到。
+members = ["crates/pulse-proto", "crates/pulse-server", "crates/pulse-loadgen"]
 
 [workspace.package]
 version = "0.0.1"

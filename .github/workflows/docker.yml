@@ -25,8 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      # 不需要 setup-qemu-action：Dockerfile 走的是交叉编译
+      #（--platform=$BUILDPLATFORM + TARGETARCH），不靠模拟。
+      # 在一台**完全没有 arm64 binfmt** 的机器上实测构得出 arm64 镜像，
+      # 用时从 39 分钟降到 3 分。
 
       # GHCR 是主仓库：公开镜像**没有拉取限额**，凭据用 Actions 自带的
       # GITHUB_TOKEN，不需要额外配密钥

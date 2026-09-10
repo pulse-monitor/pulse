@@ -1,27 +1,48 @@
-# 面板的 compose 模板。
+# Pulse Server 的 compose 模板。
 #
-# ⚠️ 尚未在真实 Docker 环境验证过。
+# 改两处就能用：PULSE_PUBLIC_URL 换成你的对外地址，
+# PULSE_TRUSTED_PROXY_HOPS 按前面有几层可信反代填。
 
 services:
   server:
     image: ghcr.io/pulse-monitor/pulse:latest
+    container_name: pulse
     restart: unless-stopped
-    ports: ["25774:25774"]
+    ports:
+      # 放在反代/隧道后面时改成 "127.0.0.1:25774:25774"，
+      # 这样宿主机对公网不开这个端口
+      - "25774:25774"
     volumes:
-      - ./data:/data                  # pulse.db + secret.key
+      # pulse.db + secret.key + GeoIP 缓存，备份直接打包这个目录。
+      # 用**具名卷**而不是 bind mount：镜像里的 /data 属主是 65532，
+      # 具名卷会照搬这个属主；bind mount 用的是宿主目录的属主，
+      # 得自己 chown 65532:65532，否则容器起不来
+      - pulse-data:/data
     environment:
       PULSE_BIND: "0.0.0.0:25774"
-      # 生成安装命令时用这个地址，必须是用户实际访问的对外地址
+      # 生成 Agent 安装命令时会写进去，必须是用户实际访问的对外地址
       PULSE_PUBLIC_URL: "https://panel.example.com"
       # ⚠️ 前面有几层可信反代就填几。填错等于任何人都能伪造来源 IP，
-      #    把登录限流骗过去
+      #    把登录限流骗过去。直连部署填 0
       PULSE_TRUSTED_PROXY_HOPS: "1"
       PULSE_PUBLIC_MODE: "public"     # public | private
-      # 不设则首次启动自动生成随机密码并打一次日志
-      # PULSE_ADMIN_PASSWORD: "..."
-      RUST_LOG: "info"
-    healthcheck:
-      test: ["CMD", "/pulse-server", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      PULSE_TIMEZONE: "Asia/Shanghai"
+      # 日志级别的变量名是 PULSE_LOG，不是 RUST_LOG
+      PULSE_LOG: "info"
+      # 可选。设了就在首次启动建好管理员、初始化页面随之关闭；
+      # 不设则由第一个打开面板的人自行设定用户名和密码
+      # PULSE_ADMIN_PASSWORD: "至少八位"
+
+volumes:
+  pulse-data:
+
+# 关于 healthcheck：
+#
+# 镜像基于 distroless，**里面没有 shell、没有 curl、没有 wget**，
+# 所以写不出 `test: ["CMD-SHELL", "curl -f ..."]` 这种检查 ——
+# 写了只会让容器永远 unhealthy（这个模板里原先就是这样的：
+# 它调的 `/pulse-server healthcheck` 子命令根本不存在）。
+#
+# 要做健康检查的话在**宿主机**上探 HTTP：
+#   curl -fsS http://127.0.0.1:25774/api/v1/health
+# 返回 {"status":"ok","version":"..."}，不需要认证，也不泄露内部细节。

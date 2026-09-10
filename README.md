@@ -83,6 +83,10 @@ docker run -d --name pulse -p 25774:25774 -v pulse-data:/data \
 
 镜像也发在 `jinqians/pulse-server`，`linux/amd64` 与 `linux/arm64` 都有。
 
+**`-v pulse-data:/data` 要用具名卷** —— 容器以非 root（uid 65532）运行，
+bind mount 的属主默认是 root，写不进去。compose 模板与备份恢复见
+[Docker 部署](https://pulse-doc.pages.dev/install/docker)。
+
 ### 不想开入站端口
 
 用 [Cloudflare Tunnel](https://pulse-doc.pages.dev/install/config#cloudflare-tunnel-cloudflared)，

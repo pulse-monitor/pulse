@@ -123,10 +123,19 @@ if [ "$UNINSTALL" -eq 1 ]; then
         systemctl disable "$SERVICE" 2>/dev/null || true
         rm -f "/etc/systemd/system/$SERVICE.service"
         systemctl daemon-reload 2>/dev/null || true
+    elif [ "$INIT" = openrc ]; then
+        rc-service "$SERVICE" stop 2>/dev/null || true
+        rc-update del "$SERVICE" default 2>/dev/null || true
+        rm -f "/etc/init.d/$SERVICE" "/var/log/$SERVICE.log"
     fi
     rm -rf "$STATE_DIR" "$CONF_DIR" "$INSTALL_DIR"
     if id "$RUN_USER" >/dev/null 2>&1; then
-        userdel "$RUN_USER" 2>/dev/null || true
+        # userdel 来自 shadow 套件，Alpine 上没有 —— busybox 提供的是 deluser。
+        # 只写 userdel 的话卸载会留下一个用不掉的用户，而且不报错（实测踩到）。
+        userdel "$RUN_USER" 2>/dev/null \
+          || deluser "$RUN_USER" 2>/dev/null \
+          || warn "删除用户 $RUN_USER 失败，可手动清理"
+        delgroup "$RUN_USER" 2>/dev/null || groupdel "$RUN_USER" 2>/dev/null || true
     fi
     say "已卸载。系统中不应再有残留 —— 可用 'id $RUN_USER' 与 'ls $STATE_DIR' 确认。"
     trap - EXIT
@@ -135,7 +144,10 @@ fi
 
 [ -n "$SERVER" ] || die "缺少 --server"
 [ -n "$TOKEN" ]  || die "缺少 --token"
-[ "$INIT" = systemd ] || die "只支持 systemd（检测到: $INIT）。其他 init 请参考 deploy/ 目录手动配置。"
+case "$INIT" in
+    systemd|openrc) ;;
+    *) die "不支持的 init（检测到: $INIT）。目前支持 systemd 与 OpenRC。" ;;
+esac
 
 # ── 平台 ───────────────────────────────────────────────────────────────────
 case "$(uname -m)" in
@@ -158,11 +170,29 @@ if id "$RUN_USER" >/dev/null 2>&1; then
     say "用户 $RUN_USER 已存在"
 else
     say "创建非登录系统用户 $RUN_USER"
-    useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --home-dir "$STATE_DIR" "$RUN_USER" 2>/dev/null \
-      || adduser --system --no-create-home --shell /usr/sbin/nologin \
-                 --home "$STATE_DIR" "$RUN_USER" \
-      || die "创建用户失败"
+    # nologin 的路径各发行版不一样：Debian 系在 /usr/sbin，Alpine 在 /sbin
+    NOLOGIN=$(command -v nologin 2>/dev/null || true)
+    if [ -z "$NOLOGIN" ]; then
+        for c in /usr/sbin/nologin /sbin/nologin /bin/false; do
+            [ -x "$c" ] && { NOLOGIN=$c; break; }
+        done
+    fi
+
+    if command -v useradd >/dev/null 2>&1; then
+        # shadow 套件（Debian / RHEL / Arch…）
+        useradd --system --no-create-home --shell "$NOLOGIN" \
+          --home-dir "$STATE_DIR" "$RUN_USER" || die "创建用户失败"
+    elif adduser --help 2>&1 | grep -q -- '-S'; then
+        # busybox 的 adduser（Alpine）。**参数语法和 Debian 版完全不同** ——
+        # 没有 --system / --no-create-home 这些长选项，照搬会直接报错。
+        addgroup -S "$RUN_USER" 2>/dev/null || true
+        adduser -S -H -s "$NOLOGIN" -h "$STATE_DIR" -G "$RUN_USER" "$RUN_USER" \
+          || die "创建用户失败"
+    else
+        # Debian 的 adduser（perl 脚本版）
+        adduser --system --no-create-home --shell "$NOLOGIN" \
+          --home "$STATE_DIR" "$RUN_USER" || die "创建用户失败"
+    fi
 fi
 
 install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$STATE_DIR" "$BIN_DIR"
@@ -249,7 +279,8 @@ chown root:"$RUN_USER" "$CONF_DIR/env" 2>/dev/null || true
 # 上面这些运行期选项只是**首次配置**的冗余：真正的来源是面板数据库，
 # agent 连上后会立刻收到一份下发的配置并以它为准。
 
-# ── systemd unit ───────────────────────────────────────────────────────────
+# ── 服务定义 ───────────────────────────────────────────────────────────────
+if [ "$INIT" = systemd ]; then
 # 每条硬化指令的理由改动前请先读那一篇：
 # ProtectHome / ProcSubset / ProtectProc 三条改错会**静默地**弄坏采集。
 cat > "/etc/systemd/system/$SERVICE.service" <<UNIT
@@ -309,23 +340,116 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 WantedBy=multi-user.target
 UNIT
 
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-systemctl restart "$SERVICE"
+    systemctl daemon-reload
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE"
+else
+    # OpenRC（Alpine 等）。
+    #
+    # 说明白一点：**OpenRC 给不了 systemd 那套硬化**（ProtectSystem、
+    # SystemCallFilter、CapabilityBoundingSet 这些都是 systemd 特有的）。
+    # 这里能保证的还是最要紧的那条 —— **以非 root 专用用户运行**，
+    # 其余的命名空间与系统调用限制在 OpenRC 下没有等价物。
+    #
+    # supervise-daemon 而不是 start-stop-daemon：前者会盯着进程、
+    # 挂了自动拉起，等价于 systemd 的 Restart=always。
+cat > "/etc/init.d/$SERVICE" <<'RCSCRIPT'
+#!/sbin/openrc-run
+
+name="pulse-agent"
+description="Pulse monitoring agent"
+
+: ${cfgfile:=/etc/pulse-agent/env}
+
+command="__BIN_DIR__/pulse-agent"
+command_user="__RUN_USER__:__RUN_USER__"
+command_background=false
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+# 环境变量必须在**脚本顶层**读，不能放进 start_pre。
+#
+# start_pre 跑在另一个 shell 里，它 export 的变量**不会**传给
+# supervise-daemon 起的子进程 —— 实测过：start_pre 里 export MYVAR=x，
+# 子进程拿到的是空的。结果就是 agent 用默认的 ws://127.0.0.1:25774 去连，
+# 401 之后不断重连，而 rc-service status 显示 "started"（supervise-daemon
+# 自己活着），从外面完全看不出哪里错了。
+#
+# OpenRC 没有 systemd 的 EnvironmentFile，顶层 source 是唯一可靠的做法。
+if [ -r "$cfgfile" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$cfgfile"
+    set +a
+fi
+
+start_pre() {
+    checkpath -d -m 0750 -o __RUN_USER__:__RUN_USER__ "__STATE_DIR__"
+    checkpath -f -m 0644 -o __RUN_USER__:__RUN_USER__ "/var/log/${RC_SVCNAME}.log"
+    if [ ! -r "$cfgfile" ]; then
+        eerror "配置文件不存在或不可读: $cfgfile"
+        return 1
+    fi
+    if [ -z "$PULSE_TOKEN" ]; then
+        eerror "$cfgfile 里没有 PULSE_TOKEN"
+        return 1
+    fi
+}
+RCSCRIPT
+    # 上面用了带引号的 heredoc（避免 $RC_SVCNAME 这类被提前展开），
+    # 所以我们自己的变量要在这里替换回去
+    sed -i \
+        -e "s|__BIN_DIR__|$BIN_DIR|g" \
+        -e "s|__RUN_USER__|$RUN_USER|g" \
+        -e "s|__STATE_DIR__|$STATE_DIR|g" \
+        "/etc/init.d/$SERVICE"
+    chmod 0755 "/etc/init.d/$SERVICE"
+
+    rc-update add "$SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$SERVICE" restart
+fi
+
 
 # ── 副作用后验证：轮询到 active，失败时自动打诊断 ─────────────────────────
 say "等待服务启动…"
+# 探测「服务是否已在运行」。两套 init 的问法不一样，抽出来免得下面重复判断。
+is_running() {
+    if [ "$INIT" = systemd ]; then
+        systemctl is-active --quiet "$SERVICE"
+    else
+        rc-service "$SERVICE" status 2>/dev/null | grep -q started
+    fi
+}
+
 i=0
 while [ "$i" -lt 30 ]; do
-    if systemctl is-active --quiet "$SERVICE"; then
+    if is_running; then
         rm -rf "$TMP"; TMP=""; trap - EXIT
         printf '\n%s✔ 安装完成%s\n' "$GRN" "$RST"
         [ "$UPGRADE" -eq 1 ] && printf '  （升级，已保留原配置的备份）\n'
         printf '  运行身份: %s（非 root）\n' "$RUN_USER"
         printf '  二进制  : %s\n' "$BIN_DIR/pulse-agent"
         printf '  配置    : %s (0600)\n' "$CONF_DIR/env"
-        printf '\n  查看日志: journalctl -u %s -f\n' "$SERVICE"
-        printf '  加固评分: systemd-analyze security %s\n' "$SERVICE"
+        if [ "$INIT" = systemd ]; then
+            printf '\n  查看日志: journalctl -u %s -f\n' "$SERVICE"
+            printf '  加固评分: systemd-analyze security %s\n' "$SERVICE"
+        else
+            printf '\n  查看日志: tail -f /var/log/%s.log\n' "$SERVICE"
+            printf '  服务状态: rc-service %s status\n' "$SERVICE"
+            # 说清楚代价，别让人以为两边一样安全
+            printf '  %s注意%s: OpenRC 没有 systemd 那套沙箱（ProtectSystem / SystemCallFilter\n' "$YEL" "$RST"
+            printf '         等都是 systemd 特有）。这里保证的是**非 root 专用用户运行**，\n'
+            printf '         其余的命名空间与系统调用限制在 OpenRC 下没有等价物。\n'
+        fi
         printf '  确认无端口: ss -lntp | grep pulse   （应无输出）\n'
         printf '  卸载    : sh install.sh --uninstall\n'
         exit 0
@@ -337,5 +461,9 @@ done
 # 失败时把诊断直接打出来，不要让用户自己去翻
 printf '\n%s服务在 30 秒内没有进入 active 状态。%s\n' "$RED" "$RST" >&2
 printf '最近的日志：\n' >&2
-journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+if [ "$INIT" = systemd ]; then
+    journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+else
+    tail -n 30 "/var/log/$SERVICE.log" >&2 2>/dev/null || rc-service "$SERVICE" status >&2 2>/dev/null || true
+fi
 exit 1

@@ -26,6 +26,7 @@ use serde::Serialize;
 use crate::auth::{Jwt, LoginLimiter, TokenKind};
 use crate::state::AppState;
 use crate::store::Storage;
+use tower_http::compression::CompressionLayer;
 
 /// 服务端运行配置。
 #[derive(Debug, Clone)]
@@ -245,7 +246,9 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr, hops: usize) -> IpAddr {
 /// SPA 需要 fallback：客户端路由的 `/server/xxx` 在磁盘上没有对应文件，
 /// 必须回到 index.html 由前端接管，否则刷新页面就是 404。
 fn static_files(dir: &str) -> Router<Ctx> {
+    use axum::http::{header, HeaderValue};
     use tower_http::services::{ServeDir, ServeFile};
+    use tower_http::set_header::SetResponseHeaderLayer;
     let index = std::path::Path::new(dir).join("index.html");
     if !index.exists() {
         // 没构建前端时给一句人话，而不是一个空白的 404
@@ -261,7 +264,26 @@ fn static_files(dir: &str) -> Router<Ctx> {
             }),
         );
     }
-    Router::new().fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+    // 带 hash 的资源（/assets/xxx-a1b2c3.js）内容一变文件名就变，
+    // 所以可以放心地让浏览器永久缓存。不打这个头的话每次导航都要发一次
+    // 条件请求 —— 本地没感觉，走 Cloudflare 隧道或跨洲访问时就是肉眼可见的卡顿。
+    //
+    // index.html 相反：**必须每次都回源校验**，否则发了新版本用户还拿着旧的
+    // 入口文件，里面引的是已经不存在的 hash 文件名，页面直接白屏。
+    Router::new()
+        .nest_service(
+            "/assets",
+            ServeDir::new(std::path::Path::new(dir).join("assets")),
+        )
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ))
+        .fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
 }
 
 pub fn router(ctx: Ctx, web_dir: &str) -> Router {
@@ -275,6 +297,9 @@ pub fn router(ctx: Ctx, web_dir: &str) -> Router {
         .merge(agent::routes())
         // 静态文件放最后：API 路由优先匹配
         .merge(static_files(web_dir))
+        // 压缩放在最外层，API 的 JSON 和前端产物都能受益。
+        // 前端 index.js 近 300 KB，gzip 后 84 KB —— 跨洲或走隧道时差别很明显。
+        .layer(CompressionLayer::new())
         .with_state(ctx)
 }
 

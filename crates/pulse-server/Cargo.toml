@@ -14,7 +14,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
-tower-http = { version = "0.7.1", features = ["fs", "cors"] }
+# compression-gzip / -br：前端产物近 300 KB，不压缩的话每次都要原样传输。
+# 走 Cloudflare 隧道或跨洲访问时这就是一两秒的差别。
+# set-header：给带 hash 的静态资源打 immutable 缓存头
+tower-http = { version = "0.7.1", features = ["fs", "cors", "compression-gzip", "compression-br", "set-header"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 async-trait = "0.1.92"
 dashmap = "6.2.1"

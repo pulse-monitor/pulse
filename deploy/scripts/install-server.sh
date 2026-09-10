@@ -150,7 +150,7 @@ fi
 
 {
     echo "[Unit]"
-    echo "Description=Pulse 面板"
+    echo "Description=Pulse Server"
     echo "After=network-online.target"
     echo "Wants=network-online.target"
     echo

@@ -1,6 +1,10 @@
 //! 存储层抽象。
 //!
-//! 所有具体后端（SQLite / PostgreSQL）都实现 [`Storage`]，上层只认这个 trait。
+//! 具体后端实现 [`Storage`]，上层只认这个 trait。
+//!
+//! **目前只有 SQLite 一个实现。** 抽成 trait 是为了将来接别的后端时
+//! 不必动上层，但在真的写出第二个实现之前，别在文档里说「支持 PostgreSQL」——
+//! `tools/check-deps.sh` 还断言着 sqlx-postgres 不在依赖图里。
 //! 设计约束来自 ：
 //!
 //! - **写只有批量接口**，没有单行写。单行独立事务是 SQLite 慢的根源。

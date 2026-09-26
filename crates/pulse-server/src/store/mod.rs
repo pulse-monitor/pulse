@@ -936,12 +936,28 @@ pub trait Storage: Send + Sync + 'static {
     ) -> Result<Option<i64>>;
     async fn get_admin(&self, username: &str) -> Result<Option<AdminUser>>;
     async fn touch_admin_login(&self, id: i64, now: i64) -> Result<()>;
+    /// 改密码。返回 false = 管理员不存在。
+    async fn set_admin_password(&self, id: i64, password_hash: &str) -> Result<bool>;
 
     // ── refresh token 吊销 ──
     async fn revoke_token(&self, jti_hash: &str, expires_at: i64) -> Result<()>;
     async fn is_revoked(&self, jti_hash: &str) -> Result<bool>;
     /// 清掉已经过了原始有效期的吊销记录 —— 它们再也不会被查到了
     async fn sweep_revoked(&self, now: i64) -> Result<u64>;
+    // ── refresh 会话追踪（改密码时吊销用）──
+    /// 记一笔签发出去的 refresh。只存 jti 的 SHA-256，泄露也拿不到可用 token。
+    async fn record_refresh_session(
+        &self,
+        admin_id: i64,
+        jti_hash: &str,
+        expires_at: i64,
+    ) -> Result<()>;
+    /// 删一笔 refresh 会话（退出登录 / 轮换时调用）。
+    async fn delete_refresh_session(&self, jti_hash: &str) -> Result<()>;
+    /// 该管理员全部还没清理的 refresh 会话：(jti 哈希, 过期时间)。
+    async fn list_refresh_sessions(&self, admin_id: i64) -> Result<Vec<(String, i64)>>;
+    /// 清掉已过期的会话记录。
+    async fn sweep_refresh_sessions(&self, now: i64) -> Result<u64>;
 
     // ── 服务器管理 ──
     async fn create_server(&self, name: &str, token_hash: &str, now: i64) -> Result<ServerRecord>;

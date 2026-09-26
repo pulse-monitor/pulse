@@ -23,6 +23,7 @@ pub fn routes() -> Router<Ctx> {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/admin/password", put(change_password))
         .route(
             "/api/v1/admin/servers",
             get(list_servers).post(create_server),
@@ -118,19 +119,21 @@ async fn login(
     ctx.limiter.record_success(ip);
 
     let now = now_unix();
-    let out = issue_session(&ctx, jar, &user.username)?;
+    let out = issue_session(&ctx, jar, user.id, &user.username).await?;
     let _ = ctx.store.touch_admin_login(user.id, now).await;
     info!(%ip, user = %user.username, "登录成功");
     Ok(out)
 }
 
-/// 签发 access + refresh，并把 refresh 放进 cookie。
+/// 签发 access + refresh，并把 refresh 放进 cookie，同时记一笔 refresh 会话。
 ///
 /// 登录和首次初始化共用 —— 初始化完直接就是登录态，不该让用户刚设完
-/// 密码又立刻输一遍。
-fn issue_session(
+/// 密码又立刻输一遍。会话记录是给「改密码时吊销该管理员全部 refresh」
+/// 用的：签发时不记，改密码时就不知道该吊销哪些 jti。
+async fn issue_session(
     ctx: &Ctx,
     jar: CookieJar,
+    admin_id: i64,
     username: &str,
 ) -> Result<(CookieJar, Json<LoginResp>), ApiError> {
     let now = now_unix();
@@ -138,10 +141,23 @@ fn issue_session(
         .jwt
         .issue(username, TokenKind::Access, now)
         .map_err(|e| ApiError::internal("签发 access token", e))?;
-    let (refresh, _) = ctx
+    let (refresh, jti) = ctx
         .jwt
         .issue(username, TokenKind::Refresh, now)
         .map_err(|e| ApiError::internal("签发 refresh token", e))?;
+    // 只记 jti 的哈希。记失败不拦登录 —— 最坏是改密码时漏吊销这一个会话，
+    // 而拦登录会把用户锁在外面
+    if let Err(e) = ctx
+        .store
+        .record_refresh_session(
+            admin_id,
+            &auth::token_hash(&jti),
+            now + REFRESH_TTL.as_secs() as i64,
+        )
+        .await
+    {
+        warn!(user = username, "记录 refresh 会话失败: {e}");
+    }
     Ok((
         jar.add(refresh_cookie(
             refresh,
@@ -290,7 +306,7 @@ async fn setup(
     // warn 而不是 info：这条是事后追责的锚点，不该淹在 info 里
     warn!(%ip, user = %username, "面板已初始化，管理员由该 IP 创建");
 
-    let out = issue_session(&ctx, jar, username)?;
+    let out = issue_session(&ctx, jar, id, username).await?;
     let _ = ctx.store.touch_admin_login(id, now_unix()).await;
     Ok(out)
 }
@@ -348,10 +364,26 @@ async fn refresh(
     // 轮换 refresh：旧的立刻作废。这样 refresh 被偷走后，
     // 真正的用户一续期就会让攻击者手里的那个失效
     let _ = ctx.store.revoke_token(&jti_hash, claims.exp).await;
-    let (new_refresh, _) = ctx
+    let _ = ctx.store.delete_refresh_session(&jti_hash).await;
+    let (new_refresh, new_jti) = ctx
         .jwt
         .issue(&claims.sub, TokenKind::Refresh, now)
         .map_err(|e| ApiError::internal("签发 refresh token", e))?;
+    // 续期也要换记新会话，否则改密码时这个新会话吊销不到。
+    // 记失败不拦续期 —— 最坏是改密码时漏吊销这一个会话
+    if let Ok(Some(admin)) = ctx.store.get_admin(&claims.sub).await {
+        if let Err(e) = ctx
+            .store
+            .record_refresh_session(
+                admin.id,
+                &auth::token_hash(&new_jti),
+                now + REFRESH_TTL.as_secs() as i64,
+            )
+            .await
+        {
+            warn!(user = %claims.sub, "记录 refresh 会话失败: {e}");
+        }
+    }
 
     Ok((
         jar.add(refresh_cookie(
@@ -368,16 +400,102 @@ async fn refresh(
 async fn logout(State(ctx): State<Ctx>, jar: CookieJar) -> ApiResult<(CookieJar, StatusCode)> {
     if let Some(c) = jar.get(REFRESH_COOKIE) {
         if let Ok(claims) = ctx.jwt.verify(c.value(), TokenKind::Refresh) {
-            let _ = ctx
-                .store
-                .revoke_token(&auth::token_hash(&claims.jti), claims.exp)
-                .await;
+            let jti_hash = auth::token_hash(&claims.jti);
+            let _ = ctx.store.revoke_token(&jti_hash, claims.exp).await;
+            let _ = ctx.store.delete_refresh_session(&jti_hash).await;
         }
     }
     Ok((
         jar.remove(Cookie::from(REFRESH_COOKIE)),
         StatusCode::NO_CONTENT,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// 改密码
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    old_password: String,
+    new_password: String,
+}
+
+/// 密码长度上限。argon2 的计算成本随输入长度增长（无上限是个 DoS 面），
+/// 256 个字符对人类密码绰绰有余。
+const PASSWORD_MAX: usize = 256;
+
+async fn change_password(
+    admin: Admin,
+    State(ctx): State<Ctx>,
+    Json(req): Json<ChangePasswordReq>,
+) -> ApiResult<StatusCode> {
+    // 强度门槛与「首次初始化」/`PULSE_ADMIN_PASSWORD` 两条路径保持一致
+    let new_len = req.new_password.chars().count();
+    if new_len < PASSWORD_MIN {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "BAD_PASSWORD",
+            format!("新密码至少需要 {PASSWORD_MIN} 个字符"),
+        ));
+    }
+    if new_len > PASSWORD_MAX {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "BAD_PASSWORD",
+            format!("新密码不能超过 {PASSWORD_MAX} 个字符"),
+        ));
+    }
+
+    let user = ctx
+        .store
+        .get_admin(&admin.username)
+        .await
+        .map_err(|e| ApiError::internal("查询管理员", e))?
+        .ok_or_else(|| ApiError::unauthorized("管理员不存在"))?;
+    if !auth::verify_password(&req.old_password, &user.password_hash) {
+        warn!(user = %admin.username, "改密码失败：旧密码不正确");
+        return Err(ApiError::unauthorized("旧密码不正确"));
+    }
+    if auth::verify_password(&req.new_password, &user.password_hash) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "SAME_PASSWORD",
+            "新密码不能与旧密码相同",
+        ));
+    }
+
+    let hash =
+        auth::hash_password(&req.new_password).map_err(|e| ApiError::internal("计算密码哈希", e))?;
+    if !ctx
+        .store
+        .set_admin_password(user.id, &hash)
+        .await
+        .map_err(|e| ApiError::internal("更新密码", e))?
+    {
+        return Err(ApiError::unauthorized("管理员不存在"));
+    }
+
+    // 吊销该管理员全部未过期的 refresh：密码泄露时，偷到 refresh 的攻击者
+    // 最长能用 7 天 —— 改完密码必须让这些会话立刻失效。
+    // 本次请求的 access token（≤15 分钟）不受影响，过期后需重新登录。
+    let now = now_unix();
+    let sessions = ctx
+        .store
+        .list_refresh_sessions(user.id)
+        .await
+        .map_err(|e| ApiError::internal("查询 refresh 会话", e))?;
+    let mut revoked = 0;
+    for (jti_hash, exp) in &sessions {
+        if *exp > now {
+            let _ = ctx.store.revoke_token(jti_hash, *exp).await;
+            revoked += 1;
+        }
+        let _ = ctx.store.delete_refresh_session(jti_hash).await;
+    }
+    // warn 而不是 info：密码变更是事后追责的锚点
+    warn!(user = %admin.username, revoked, "管理员修改密码，已吊销其 refresh 会话");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +631,13 @@ async fn regen_token(
     Path(id): Path<ServerId>,
 ) -> ApiResult<impl IntoResponse> {
     let token = auth::generate_token().map_err(|e| ApiError::internal("生成 token", e))?;
+    // 先取 uuid：换完 token 就只剩哈希查得到记录，而踢连接要靠 uuid
+    let server = ctx
+        .store
+        .get_server(id)
+        .await
+        .map_err(|e| ApiError::internal("查询服务器", e))?
+        .ok_or_else(|| ApiError::not_found("服务器不存在"))?;
     if !ctx
         .store
         .set_server_token(id, &auth::token_hash(&token))
@@ -520,6 +645,13 @@ async fn regen_token(
         .map_err(|e| ApiError::internal("更新 token", e))?
     {
         return Err(ApiError::not_found("服务器不存在"));
+    }
+    // 光改数据库不够：已建的 WS 连接心跳不断就一直活着，
+    // 旧凭据拿着旧连接能继续上报。"旧 token 立即失效"要连连接一起踢掉 ——
+    // agent 会用旧 token 重连并收到 401（凭据错了不无限重试），
+    // 用户用新 token 重装/改配置后恢复上报。
+    if ctx.state.kick(&server.uuid) {
+        info!(id, "已踢掉该机器的现有 agent 连接");
     }
     warn!(id, "已重置 agent token，旧凭据立即失效");
     Ok(Json(RegenResp {

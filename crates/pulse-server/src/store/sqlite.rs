@@ -508,6 +508,16 @@ impl Storage for SqliteStore {
         Ok(())
     }
 
+    async fn set_admin_password(&self, id: i64, password_hash: &str) -> Result<bool> {
+        Ok(sqlx::query("UPDATE admin_user SET password_hash = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(id)
+            .execute(&self.write)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
     // ── refresh token 吊销 ──
 
     async fn revoke_token(&self, jti_hash: &str, expires_at: i64) -> Result<()> {
@@ -535,6 +545,57 @@ impl Storage for SqliteStore {
     async fn sweep_revoked(&self, now: i64) -> Result<u64> {
         Ok(
             sqlx::query("DELETE FROM revoked_token WHERE expires_at < ?")
+                .bind(now)
+                .execute(&self.write)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    // ── refresh 会话追踪 ──
+
+    async fn record_refresh_session(
+        &self,
+        admin_id: i64,
+        jti_hash: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO refresh_session (token_hash, admin_id, expires_at) VALUES (?, ?, ?)
+             ON CONFLICT(token_hash) DO UPDATE
+             SET admin_id = excluded.admin_id, expires_at = excluded.expires_at",
+        )
+        .bind(jti_hash)
+        .bind(admin_id)
+        .bind(expires_at)
+        .execute(&self.write)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_refresh_session(&self, jti_hash: &str) -> Result<()> {
+        sqlx::query("DELETE FROM refresh_session WHERE token_hash = ?")
+            .bind(jti_hash)
+            .execute(&self.write)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_refresh_sessions(&self, admin_id: i64) -> Result<Vec<(String, i64)>> {
+        Ok(
+            sqlx::query("SELECT token_hash, expires_at FROM refresh_session WHERE admin_id = ?")
+                .bind(admin_id)
+                .fetch_all(&self.read)
+                .await?
+                .into_iter()
+                .map(|r| (r.get("token_hash"), r.get("expires_at")))
+                .collect(),
+        )
+    }
+
+    async fn sweep_refresh_sessions(&self, now: i64) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM refresh_session WHERE expires_at < ?")
                 .bind(now)
                 .execute(&self.write)
                 .await?
@@ -1808,6 +1869,12 @@ impl Storage for SqliteStore {
 
         // 每层：起点 = 水位线（或源表最早数据），终点 = min(对齐终点, 起点 + 窗口上限)
         let mut step = |from: i64, end: i64, bucket: i64| -> Option<(i64, i64)> {
+            // 水位线可能落在桶中间（上一轮被 ROLLUP_MAX_BUCKETS 截断时）——
+            // 必须向下对齐到桶边界重算整个头桶。ON CONFLICT 是纯覆盖语义，
+            // 不对齐的话本轮只聚合 [from, t)，会把上一轮已写好的 [B, from)
+            // 永久覆盖丢弃。源表（minute / raw）在保留期内数据还在，
+            // 重算整桶的结果是完整的，所以对齐重算是安全的。
+            let from = from.div_euclid(bucket) * bucket;
             if from >= end {
                 return None;
             }

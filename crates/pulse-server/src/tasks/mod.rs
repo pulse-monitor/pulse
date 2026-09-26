@@ -163,6 +163,13 @@ pub fn spawn_auth_maintenance(store: Arc<dyn Storage>, limiter: Arc<LoginLimiter
                 if n > 0 {
                     debug!(rows = n, "清理过期的吊销记录");
                 }
+                // 过期的 refresh 会话同理：改密码时只查未过期的，留着也是垃圾
+                let m = store
+                    .sweep_refresh_sessions(crate::state::now_unix())
+                    .await?;
+                if m > 0 {
+                    debug!(rows = m, "清理过期的 refresh 会话记录");
+                }
                 // 限流表按 IP 增长，长期不活动的条目要回收
                 limiter.sweep(Instant::now());
                 Ok(())

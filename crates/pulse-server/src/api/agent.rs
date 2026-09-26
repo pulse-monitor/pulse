@@ -67,6 +67,9 @@ async fn agent_ws(
 
     let ip = client_ip(&headers, peer.ip(), ctx.config.trusted_proxy_hops);
     ws.protocols([WS_SUBPROTOCOL])
+        // 单条消息 4MB：正常指标上报是 KB 级，这个数只拦异常/恶意的大包。
+        // 再大的帧 axum 会直接拒绝握手之后的第一帧。
+        .max_message_size(4 * 1024 * 1024)
         .on_upgrade(move |socket| handle(socket, ctx, server, ip))
 }
 
@@ -221,6 +224,14 @@ async fn handle(socket: WebSocket, ctx: Ctx, server: ServerRecord, ip: std::net:
                             ctx.state.on_metrics(&uuid, m);
                         }
                         Ok(AgentMsg::PingResults { results: rs }) => {
+                            // 单批条数上限：与 agent 侧的 MAX_PENDING 对齐（4096）。
+                            // 正常情况下一批是"任务数 × 几条"，远到不了这个数 ——
+                            // 到了就是 agent 侧积压或被篡改的包，直接断开而不是
+                            // 攒 Vec 把内存吃光。断开后 agent 会重连恢复。
+                            if rs.len() > 4096 {
+                                warn!(id, count = rs.len(), "延迟结果单批超限，断开连接");
+                                break;
+                            }
                             debug!(id, count = rs.len(), "收到延迟结果");
                             let rows: Vec<PingRow> = rs.iter().map(|r| PingRow {
                                 server_id: id,

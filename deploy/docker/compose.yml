@@ -23,8 +23,9 @@ services:
       # 生成 Agent 安装命令时会写进去，必须是用户实际访问的对外地址
       PULSE_PUBLIC_URL: "https://panel.example.com"
       # ⚠️ 前面有几层可信反代就填几。填错等于任何人都能伪造来源 IP，
-      #    把登录限流骗过去。直连部署填 0
-      PULSE_TRUSTED_PROXY_HOPS: "1"
+      #    把登录限流骗过去。compose 默认直连（server 直接监听公网），所以是 0；
+      #    只有前面真有 nginx/caddy 之类的反代时才调大。
+      PULSE_TRUSTED_PROXY_HOPS: "0"
       PULSE_PUBLIC_MODE: "public"     # public | private
       PULSE_TIMEZONE: "Asia/Shanghai"
       # 日志级别的变量名是 PULSE_LOG，不是 RUST_LOG

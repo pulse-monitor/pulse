@@ -171,7 +171,59 @@ pub async fn send(cfg: &ChannelConfig, msg: &NotifyMessage) -> anyhow::Result<()
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("发送失败")))
+    // 错误串会进 warn 日志和「测试渠道」接口的返回 —— 第三方返回的错误里
+    // 经常把请求 URL 原样带回来，`/bot<token>/` 这类密钥会被日志吃到。
+    // 在这里统一脱敏：两处下游都不用再各自处理。
+    Err(last_err
+        .map(|e| anyhow::anyhow!("{}", redact_secrets(&e.to_string())))
+        .unwrap_or_else(|| anyhow::anyhow!("发送失败")))
+}
+
+/// 把错误串里的渠道密钥脱敏。覆盖目前在用的三类：
+///
+/// - Telegram：`https://api.telegram.org/bot<token>/sendMessage`
+/// - 企微/飞书 webhook：`...?key=<v>` / `...&key=<v>`
+/// - 飞书签名版 webhook：`.../hook/<id>`
+///
+/// 保守起见只脱固定 marker 后面、到分隔符为止的一段，不做整串替换 ——
+/// 误伤了顶多是错误信息少几个字符，漏脱了才是真泄漏。
+fn redact_secrets(s: &str) -> String {
+    let mut out = s.to_string();
+    redact_after_marker(&mut out, "/bot", |c| c == '/');
+    redact_after_marker(&mut out, "?key=", is_secret_end);
+    redact_after_marker(&mut out, "&key=", is_secret_end);
+    redact_after_marker(&mut out, "/hook/", is_hook_end);
+    out
+}
+
+fn is_secret_end(c: char) -> bool {
+    c == '&' || c.is_whitespace() || c == '"' || c == '\''
+}
+
+fn is_hook_end(c: char) -> bool {
+    c == '/' || is_secret_end(c)
+}
+
+/// 把 `marker` 之后、到第一个分隔符为止的一段替换成 `***`。
+///
+/// 单遍向右扫描：替换后从刚写进去的 `***` 之后继续，不回头 ——
+/// 否则残留的 marker（如 "/bot***/" 里的 "/bot"）会让扫描原地打转、
+/// 整个函数永远返回不了。
+///
+/// `is_end` 用函数指针而不是闭包：`str::find` 按值吃掉 pattern，
+/// 循环里要反复用，闭包会被 move 掉。
+fn redact_after_marker(out: &mut String, marker: &str, is_end: fn(char) -> bool) {
+    let mut from = 0;
+    while let Some(rel) = out[from..].find(marker) {
+        let vs = from + rel + marker.len();
+        let vend = out[vs..].find(is_end).map(|i| vs + i).unwrap_or(out.len());
+        if vend > vs {
+            out.replace_range(vs..vend, "***");
+            from = vs + 3; // 跳过刚写进去的 "***"
+        } else {
+            from = vs; // 空值：挪过 marker，避免原地打转
+        }
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +322,36 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let back: ChannelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kind(), ChannelKind::Lark);
+    }
+
+    #[test]
+    fn redact_secrets_masks_channel_credentials() {
+        // 第三方返回的错误里经常把请求 URL 原样带回来 ——
+        // 这串会进 warn 日志和「测试渠道」接口的返回，必须先脱敏
+        let cases = [
+            (
+                "POST https://api.telegram.org/bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage: 401",
+                "123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
+            ),
+            (
+                "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abcdef-1234-5678-secret 返回 400",
+                "abcdef-1234-5678-secret",
+            ),
+            (
+                "POST https://open.feishu.cn/open-apis/bot/v2/hook/deadbeef-1234 timeout",
+                "deadbeef-1234",
+            ),
+        ];
+        for (input, secret) in cases {
+            let redacted = redact_secrets(input);
+            assert!(!redacted.contains(secret), "脱敏后仍然泄露: {redacted}");
+            assert!(redacted.contains("***"), "应该有脱敏标记: {redacted}");
+            // 幂等：脱敏过的串再脱一次必须原样返回。
+            // 回归：第一版实现里残留的 marker 会让扫描原地打转、整个测试 hang 住
+            assert_eq!(redact_secrets(&redacted), redacted, "脱敏必须幂等");
+        }
+        // 无密钥的普通错误原样保留 —— 别把正常信息也吃了
+        let plain = "connection refused";
+        assert_eq!(redact_secrets(plain), plain);
     }
 }

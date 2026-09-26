@@ -266,7 +266,7 @@ if fetch "$DOWNLOAD_BASE/v$VERSION/SHA256SUMS" "$TMP/sums" 2>/dev/null; then
         warn "清单里没有 $ASSET 的条目，跳过校验"
     fi
 else
-    warn "取不到 SHA256SUMS，跳过校验（生产环境不该出现这种情况）"
+    die "取不到 SHA256SUMS，无法校验完整性，已中止。请检查网络或稍后重试。"
 fi
 
 if [ -f "$BIN_DIR/pulse-agent" ] && cmp -s "$TMP/agent" "$BIN_DIR/pulse-agent" 2>/dev/null; then

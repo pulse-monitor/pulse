@@ -443,6 +443,23 @@ impl AppState {
         }
     }
 
+    /// 主动踢掉一台机器的现有 WS 连接。
+    ///
+    /// `regen_token` 承诺"旧凭据立即失效" —— 光改数据库不够，已建连接的
+    /// 心跳不断就一直活着。复用"新连接顶替旧连接"的机制：丢掉 state 里的
+    /// 发送端，旧连接循环的 rx 随之关闭，它会发 Close 帧并退出
+    ///（见 `api::agent::handle` 的下行分支）。返回当时是否有连接被踢掉。
+    pub fn kick(&self, uuid: &str) -> bool {
+        if let Some(mut e) = self.inner.get_mut(uuid) {
+            let had = e.tx.is_some();
+            e.tx = None;
+            e.connected = false;
+            had
+        } else {
+            false
+        }
+    }
+
     /// 把新配置立刻推给在线的 agent。返回是否真的送出去了。
     ///
     /// 送不出去不是错误 —— 机器可能正好离线，重连时 agent 会重新拉一次配置。
@@ -1052,6 +1069,29 @@ mod tests {
             "rtt 按 recv 加权：(1×3+5×1)/4 = 2，实际 {}",
             l.rtt_ms
         );
+    }
+
+    #[test]
+    fn kick_closes_the_live_connection() {
+        // regen_token 承诺"旧凭据立即失效"：踢掉后旧连接的 rx 必须关闭，
+        // 它的循环据此发 Close 帧退出，而不是靠心跳超时慢慢死
+        let st = AppState::new();
+        let id = derive_id("tok");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn = st.on_connect(&id, tx);
+        assert!(st.kick(&id), "有连接时应返回 true");
+        assert!(rx.is_closed(), "发送端丢掉后旧连接的 rx 必须关闭");
+        assert_eq!(st.summary().online, 0, "踢掉后应立刻显示离线");
+
+        // 旧循环退出时会调 on_disconnect：代号对得上，不能影响之后的新连接
+        st.on_disconnect(&id, conn);
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        st.on_connect(&id, tx2);
+        assert!(
+            st.push_config(&id, RuntimeConfig::default()),
+            "新连接的发送端必须可用"
+        );
+        assert!(!st.kick("no-such-server"), "没有条目时返回 false");
     }
 
     #[test]

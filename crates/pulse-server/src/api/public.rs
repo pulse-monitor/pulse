@@ -44,24 +44,45 @@ fn gate(ctx: &Ctx) -> ApiResult<()> {
 
 /// 安装脚本。**不需要认证** —— 脚本本身不含任何秘密，
 /// token 是用户从安装命令里带进来的参数。
-async fn install_sh() -> impl IntoResponse {
-    (
+///
+/// 面板是 http 时拒绝下发：安装命令里带着 agent token，
+/// 明文链路上会被中间人一把拿走。启动时这里已经打过 warn，
+/// 但 warn 没人看 —— 下发脚本是最后的关口，必须硬拦。
+/// 例外是本地回环（127.0.0.1 / ::1），见 `tls::insecure_public_url`。
+async fn install_sh(State(ctx): State<Ctx>) -> ApiResult<impl IntoResponse> {
+    if crate::tls::insecure_public_url(&ctx.config.panel_url) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "INSECURE_PANEL_URL",
+            "面板是 http 明文地址，下发安装脚本会泄露 agent token —— \
+             请先给面板配上 https（PULSE_PUBLIC_URL 用 https:// 开头）",
+        ));
+    }
+    Ok((
         [(
             axum::http::header::CONTENT_TYPE,
             "text/x-shellscript; charset=utf-8",
         )],
         INSTALL_SH,
-    )
+    ))
 }
 
-async fn install_ps1() -> impl IntoResponse {
-    (
+async fn install_ps1(State(ctx): State<Ctx>) -> ApiResult<impl IntoResponse> {
+    if crate::tls::insecure_public_url(&ctx.config.panel_url) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "INSECURE_PANEL_URL",
+            "面板是 http 明文地址，下发安装脚本会泄露 agent token —— \
+             请先给面板配上 https（PULSE_PUBLIC_URL 用 https:// 开头）",
+        ));
+    }
+    Ok((
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )],
         INSTALL_PS1,
-    )
+    ))
 }
 
 /// 不需要认证：负载均衡与容器健康检查要用。

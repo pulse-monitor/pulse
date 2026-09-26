@@ -52,9 +52,9 @@ pub async fn evaluate_once(
 
         for val in &values.servers {
             let id = val.server_id;
-            // 分组范围需要机器的 group_id；它不在实时层里，
-            // 但 PingScope::All 与 Servers 不需要查库 —— 这是最常见的两种
-            if !scope.covers(id, None) && !matches!(scope, crate::store::PingScope::Group(_)) {
+            // group_id 在价值缓存里（实时层没有）。All / Servers 不需要它，
+            // Group 靠它过滤 —— covers 内部处理了这三种情况。
+            if !scope.covers(id, val.group_id) {
                 continue;
             }
             // 没有实时条目 = 从没连过 / 面板重启后还没重连 —— 视为离线
@@ -74,11 +74,13 @@ pub async fn evaluate_once(
                 let current = store.get_alert(rule.id, Some(id), kind_str).await?;
                 let (next, action) = alert::step(current, cond.met, &params, now);
 
+                // payload 先算好：dispatch 全失败时要回写修正 last_notified_at，
+                // 那次 upsert 也得带上它（upsert 是删插语义，传 None 会清掉）
+                let payload = serde_json::json!({
+                    "value": cond.value, "threshold": cond.threshold,
+                });
                 match next {
                     Some(e) => {
-                        let payload = serde_json::json!({
-                            "value": cond.value, "threshold": cond.threshold,
-                        });
                         store
                             .upsert_alert(
                                 rule.id,
@@ -93,7 +95,26 @@ pub async fn evaluate_once(
                 }
 
                 if action != Action::Nothing {
-                    dispatch(rule, &channels, s, kind, &cond, action, panel_url, tz, now).await;
+                    let sent =
+                        dispatch(rule, &channels, s, kind, &cond, action, panel_url, tz, now).await;
+                    if !sent {
+                        // 全部渠道都失败 = 通知实际没发出去。但 step() 已经把
+                        // last_notified_at 记成 now 并落盘 —— 不修正的话冷却期内
+                        // 这条告警会被"消音"，渠道故障期的告警就丢了，要等一整个
+                        // 冷却周期。保持旧值，下一轮冷却判定会再次到期并重试。
+                        if let Some(mut e) = next {
+                            e.last_notified_at = current.and_then(|c| c.last_notified_at);
+                            store
+                                .upsert_alert(
+                                    rule.id,
+                                    Some(id),
+                                    kind_str,
+                                    &e,
+                                    Some(&payload.to_string()),
+                                )
+                                .await?;
+                        }
+                    }
                 }
             }
         }
@@ -181,6 +202,11 @@ fn evaluate(
             }
         }
         EventKind::PingLossHigh => {
+            // 离线机器的延迟是陈旧值（on_disconnect 不清零）：机器在延迟超标
+            // 后离线，否则"已离线的机器还在报延迟高"，还会按冷却重复通知
+            if !s.online {
+                return None;
+            }
             let l = s.latency.as_ref()?;
             let t = th("loss_pct", 50.0);
             Cond {
@@ -190,6 +216,9 @@ fn evaluate(
             }
         }
         EventKind::PingLatencyHigh => {
+            if !s.online {
+                return None;
+            }
             let l = s.latency.as_ref()?;
             let t = th("rtt_ms", 500.0);
             Cond {
@@ -236,7 +265,7 @@ async fn dispatch(
     panel_url: &str,
     tz: chrono_tz::Tz,
     now: i64,
-) {
+) -> bool {
     let resolved = action == Action::NotifyResolved;
     let ctx = template::Context {
         server: template::ServerCtx {
@@ -272,22 +301,29 @@ async fn dispatch(
         resolved,
     };
 
+    // 返回至少一个渠道是否成功：全失败时调用方要修正 last_notified_at，
+    // 否则冷却期内这条告警会被"消音"（见 evaluate_once）
+    let mut sent_any = false;
     for cid in &rule.channel_ids {
         let Some(ch) = channels.iter().find(|c| c.id == *cid && c.enabled) else {
             continue;
         };
         // 一个渠道失败不该影响其他渠道，更不该让求值循环停掉
         match notify::send(&ch.config, &msg).await {
-            Ok(()) => info!(
-                rule = rule.id,
-                channel = ch.id,
-                event = kind.as_str(),
-                "通知已发送"
-            ),
+            Ok(()) => {
+                info!(
+                    rule = rule.id,
+                    channel = ch.id,
+                    event = kind.as_str(),
+                    "通知已发送"
+                );
+                sent_any = true;
+            }
             Err(e) => warn!(rule = rule.id, channel = ch.id, "通知发送失败: {e}"),
         }
     }
     debug!(rule = rule.id, ?action, "告警动作已处理");
+    sent_any
 }
 
 #[cfg(test)]
@@ -365,6 +401,15 @@ mod tests {
         assert!(evaluate(EventKind::CpuHigh, &srv(false, 99.0), None, &p).is_none());
         assert!(evaluate(EventKind::MemHigh, &srv(false, 0.0), None, &p).is_none());
         assert!(evaluate(EventKind::DiskHigh, &srv(false, 0.0), None, &p).is_none());
+        // 延迟数据同样是陈旧的：机器在延迟超标后离线，不能继续报"延迟高"
+        let mut off = srv(false, 0.0);
+        off.latency = Some(LatencyView {
+            task_id: 1,
+            rtt_ms: 800.0,
+            loss_pct: 60.0,
+        });
+        assert!(evaluate(EventKind::PingLossHigh, &off, None, &p).is_none());
+        assert!(evaluate(EventKind::PingLatencyHigh, &off, None, &p).is_none());
     }
 
     #[test]

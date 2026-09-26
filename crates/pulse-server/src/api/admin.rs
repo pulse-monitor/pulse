@@ -465,8 +465,8 @@ async fn change_password(
         ));
     }
 
-    let hash =
-        auth::hash_password(&req.new_password).map_err(|e| ApiError::internal("计算密码哈希", e))?;
+    let hash = auth::hash_password(&req.new_password)
+        .map_err(|e| ApiError::internal("计算密码哈希", e))?;
     if !ctx
         .store
         .set_admin_password(user.id, &hash)

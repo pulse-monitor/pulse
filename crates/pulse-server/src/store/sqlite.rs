@@ -509,13 +509,15 @@ impl Storage for SqliteStore {
     }
 
     async fn set_admin_password(&self, id: i64, password_hash: &str) -> Result<bool> {
-        Ok(sqlx::query("UPDATE admin_user SET password_hash = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(id)
-            .execute(&self.write)
-            .await?
-            .rows_affected()
-            > 0)
+        Ok(
+            sqlx::query("UPDATE admin_user SET password_hash = ? WHERE id = ?")
+                .bind(password_hash)
+                .bind(id)
+                .execute(&self.write)
+                .await?
+                .rows_affected()
+                > 0,
+        )
     }
 
     // ── refresh token 吊销 ──
